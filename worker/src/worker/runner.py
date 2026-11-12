@@ -294,13 +294,51 @@ def _system_event_payload(ev: dict) -> dict:
     return payload
 
 
+# The CLI's delegation tool, "Agent" in the stream (formerly "Task").
+_DELEGATION_TOOLS = {"Agent", "Task"}
+
+
+class _Deliverable:
+    """The main agent's text, minus what it writes around its sub-agents.
+
+    Sub-agents run in the background: the main agent announces them in the
+    message that launches them and may write while they run ("the analyst is
+    still working…"). Neither belongs in the artifact.
+    """
+
+    def __init__(self) -> None:
+        self._parts: list[tuple[str | None, str]] = []
+        self._launching: set[str] = set()
+        self._running = False
+
+    def on_system(self, ev: dict) -> None:
+        if ev.get("subtype") == "background_tasks_changed":
+            self._running = bool(ev.get("tasks"))
+
+    def on_main_agent(self, ev: dict, parts: list[str]) -> None:
+        msg = ev.get("message") or {}
+        msg_id = msg.get("id")
+        # The CLI streams a message one content block at a time, all under the same id.
+        if any(b.get("type") == "tool_use" and b.get("name") in _DELEGATION_TOOLS for b in msg.get("content") or []):
+            if msg_id:
+                self._launching.add(msg_id)
+                self._parts = [(m, part) for m, part in self._parts if m != msg_id]
+            return
+        if self._running or msg_id in self._launching:
+            return
+        self._parts.extend((msg_id, part) for part in parts)
+
+    def text(self) -> str:
+        return "\n\n".join(part for _, part in self._parts).strip()
+
+
 async def run_pipeline(cancelled: asyncio.Event) -> int:
     client = OrchestratorClient()
     stop = asyncio.Event()
     hb = asyncio.create_task(_heartbeat_task(client, stop))
 
     seq = 1
-    final_text_parts: list[str] = []
+    deliverable = _Deliverable()
     cli_stderr: list[str] = []
     token_usage: dict | None = None
     exit_code = 0
@@ -372,10 +410,10 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                             payload["parent_tool_use_id"] = parent_id
                         await client.event(seq, "assistant_message", payload)
                         seq += 1
-                    # The artifact is the main agent's text only; a sub-agent's
-                    # text reaches the main agent as a tool result.
+                    # The artifact is the main agent's text only; a sub-agent
+                    # reports back to the main agent, not to the artifact.
                     if not parent_id:
-                        final_text_parts.extend(parts)
+                        deliverable.on_main_agent(ev, parts)
                 elif ev_type == "user":
                     msg = ev.get("message", {}) or {}
                     for block in msg.get("content", []) or []:
@@ -405,6 +443,7 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                     await client.event(seq, "result", token_usage)
                     seq += 1
                 elif ev_type == "system":
+                    deliverable.on_system(ev)
                     await client.event(seq, "system", _system_event_payload(ev))
                     seq += 1
                 elif ev_type == "error":
@@ -433,7 +472,7 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
             seq += 1
             return 1
 
-        artifact = "\n\n".join(final_text_parts).strip() or "(empty)"
+        artifact = deliverable.text() or "(empty)"
         output_uri = _upload_artifact(artifact)
         await client.result(output_uri=output_uri, summary=artifact[:280], token_usage=token_usage)
         return exit_code

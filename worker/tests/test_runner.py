@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from worker.runner import AgentsConfigError, _load_agents, build_command
@@ -10,6 +11,10 @@ AGENTS = {
     "analyst": {"description": "Reasons", "prompt": "Analyse.", "model": "sonnet"},
 }
 AGENTS_JSON = json.dumps(AGENTS, separators=(",", ":"))
+# claude 2.1.322, one background sub-agent: the main agent announces it, writes
+# while it runs, then answers. Recorded with --agents ECHOER, trimmed.
+RECORDED_STREAM = Path(__file__).parent / "fixtures" / "background_subagent.jsonl"
+ECHOER = {"echoer": {"description": "Uppercases a word.", "prompt": "Reply in uppercase.", "model": "haiku"}}
 
 
 def legacy_command(system_prompt: str, env: dict) -> list[str]:
@@ -234,3 +239,47 @@ def test_large_prompt_reaches_cli_on_stdin(fake_cli, run_worker, mocker):
     assert run_worker().rc == 0
     assert cli.stdin() == "x" * 300_000
     assert max(map(len, cli.argv())) < 1000
+
+
+def test_recorded_background_subagent_run(fake_cli, run_worker):
+    fake_cli(RECORDED_STREAM.read_text())
+    run = run_worker(PIPOMETA_AGENTS=json.dumps(ECHOER))
+    assert run.rc == 0
+    assert run.artifacts == ["RESULT=BANANE"]
+
+
+def _main(msg_id, *blocks):
+    return {"type": "assistant", "message": {"id": msg_id, "content": list(blocks)}}
+
+
+def _text(text):
+    return {"type": "text", "text": text}
+
+
+def _delegate(name="Agent"):
+    return {"type": "tool_use", "id": "toolu_1", "name": name, "input": {}}
+
+
+def _tasks(*ids):
+    return {"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": i} for i in ids]}
+
+
+@pytest.mark.parametrize(
+    "events,expected",
+    [
+        ([_main("m1", _text("a")), _main("m2", _text("b"))], "a\n\nb"),
+        ([_main("m1", _text("Je lance.")), _main("m1", _delegate()), _main("m2", _text("fin"))], "fin"),
+        ([_main("m1", _delegate("Task")), _main("m1", _text("lancé")), _main("m2", _text("fin"))], "fin"),
+        ([_tasks("t1"), _main("m1", _text("en attente")), _tasks(), _main("m2", _text("fin"))], "fin"),
+        ([_main(None, _text("a")), _main(None, _delegate()), _main(None, _text("b"))], "a\n\nb"),
+    ],
+    ids=["no-subagents", "text-before-launch", "text-after-launch", "text-while-running", "no-message-id"],
+)
+def test_deliverable_leaves_out_text_around_subagents(events, expected):
+    deliverable = runner._Deliverable()
+    for ev in events:
+        if ev["type"] == "system":
+            deliverable.on_system(ev)
+        else:
+            deliverable.on_main_agent(ev, [b["text"] for b in ev["message"]["content"] if b["type"] == "text"])
+    assert deliverable.text() == expected
