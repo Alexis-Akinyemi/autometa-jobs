@@ -116,9 +116,12 @@ def _prompt_from_body(body: str) -> str:
         doc = json.loads(body)
     except json.JSONDecodeError:
         return body
-    if isinstance(doc, dict):
-        return doc.get("prompt", body)
-    return body
+    if not isinstance(doc, dict) or "prompt" not in doc:
+        return body
+    prompt = doc["prompt"]
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("input bundle: `prompt` must be a non-empty string")
+    return prompt
 
 
 async def _read_prompt() -> str:

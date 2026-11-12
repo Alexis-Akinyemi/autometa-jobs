@@ -150,6 +150,13 @@ def test_https_exactly_at_cap_is_accepted(mocker, monkeypatch):
     assert _read(monkeypatch, SIGNED) == "x" * 10
 
 
+@pytest.mark.parametrize("prompt", [None, 42, ["a"], {"a": 1}, "", "  "])
+def test_invalid_prompt_value_refused(mocker, monkeypatch, prompt):
+    _serve(mocker, _body(json.dumps({"prompt": prompt}).encode()))
+    with pytest.raises(ValueError, match="non-empty string"):
+        _read(monkeypatch, SIGNED)
+
+
 @pytest.mark.parametrize(
     "uri,shown,hidden",
     [
