@@ -152,7 +152,7 @@ JSON
 )"
 ```
 
-L'ID de la job-definition est toujours `$PIPOMETA_JOB_DEFINITION_ID`. Les outils sont les noms standards des outils Claude Code ; passez une liste vide pour tout interdire.
+L'ID de la job-definition est toujours `$PIPOMETA_JOB_DEFINITION_ID`. Les outils sont les noms standards des outils Claude Code. `allowed_tools` ne retire rien à l'agent : il tourne sous `--dangerously-skip-permissions`, où cette liste ne fait que pré-autoriser ce qui l'est déjà.
 
 ⚠️ **Livrable volumineux.** L'artefact est la concaténation des messages texte de l'agent, et **une réponse est plafonnée à ~32k tokens de sortie** ; le disque et les sous-agents ne sont pas capturés. Pour une grosse sortie (longues listes, CSV de centaines de lignes), la consigne doit imposer une production **par lots sur plusieurs tours** (un `echo` Bash entre chaque lot force la clôture du message) — sinon le run échoue avec `response exceeded the output token maximum`. Recette détaillée : [README § Gros livrables](README.md#gros-livrables--produire-par-lots-limite-de-tokens).
 

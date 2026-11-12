@@ -93,7 +93,7 @@ jobsctl pipeline-create \
 ```
 
 - `--system-prompt` / `--system-prompt-file` — la consigne permanente de l'agent (voir le template ci-dessous).
-- `--config` / `--config-file` — la config JSON. `allowed_tools` : les outils autorisés (liste vide pour tout interdire) ; `scaleway_job_definition_id` : identifiant technique constant, demandez-le une fois à qui gère l'infra ; `agents` (optionnel) : des sous-agents Claude natifs, voir ci-dessous.
+- `--config` / `--config-file` — la config JSON. `allowed_tools` : des outils pré-autorisés, sans effet restrictif (l'agent tourne sans demande de permission, il a déjà accès à tous ses outils) ; `scaleway_job_definition_id` : identifiant technique constant, demandez-le une fois à qui gère l'infra ; `agents` (optionnel) : des sous-agents Claude natifs, voir ci-dessous.
 
 ### Sous-agents (optionnel)
 
