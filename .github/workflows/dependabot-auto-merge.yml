@@ -1,7 +1,7 @@
 name: Dependabot auto-merge
 
 # Queue patch and minor Dependabot PRs for auto-merge. GitHub merges them once
-# the required checks on main (Lint & format, Security, Docker) are green;
+# the required checks on main (Lint & format, Tests, Security, Docker) are green;
 # major bumps are left for a human.
 on: pull_request
 
