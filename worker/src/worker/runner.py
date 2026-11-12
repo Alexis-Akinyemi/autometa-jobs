@@ -211,13 +211,6 @@ def _parse_assistant_blocks(event: dict) -> tuple[list[dict], list[str]]:
     return blocks, text_parts
 
 
-# Name of the CLI's delegation tool. Current CLIs emit it as "Agent" in
-# stream-json; "Task" is the historical name and is still accepted in
-# --allowedTools. Either name present in the list counts.
-DELEGATION_TOOL = "Task"
-_DELEGATION_TOOL_NAMES = {"Task", "Agent"}
-
-
 class AgentsConfigError(ValueError):
     pass
 
@@ -244,14 +237,6 @@ def _load_agents(raw: str) -> dict:
     return agents
 
 
-def _with_delegation_tool(allowed_tools: str) -> str:
-    """Make sure the delegation tool is in a restricted --allowedTools list."""
-    names = {entry.strip().split("(", 1)[0] for entry in allowed_tools.split(",")}
-    if names & _DELEGATION_TOOL_NAMES:
-        return allowed_tools
-    return f"{allowed_tools},{DELEGATION_TOOL}"
-
-
 def build_command(system_prompt: str, env: Mapping[str, str], agents: dict) -> list[str]:
     """argv for the claude CLI (the prompt goes in on stdin).
 
@@ -260,8 +245,8 @@ def build_command(system_prompt: str, env: Mapping[str, str], agents: dict) -> l
     # Worker container runs as non-root `runner`, so the CLI accepts
     # --dangerously-skip-permissions. The container itself is the security
     # boundary (gVisor sandbox, ephemeral); inside, the agent should have
-    # full freedom. Per-pipeline tool restrictions can be added via
-    # PIPOMETA_ALLOWED_TOOLS if needed.
+    # full freedom. Under this flag PIPOMETA_ALLOWED_TOOLS (--allowedTools)
+    # only pre-approves tools, it removes none.
     cmd = [
         CLAUDE_BIN,
         "--output-format",
@@ -273,8 +258,6 @@ def build_command(system_prompt: str, env: Mapping[str, str], agents: dict) -> l
         "-p",
     ]
     if extra_tools := (env.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
-        if agents:
-            extra_tools = _with_delegation_tool(extra_tools)
         cmd.extend(["--allowedTools", extra_tools])
     if max_turns := (env.get("PIPOMETA_MAX_TURNS") or "").strip():
         cmd.extend(["--max-turns", max_turns])

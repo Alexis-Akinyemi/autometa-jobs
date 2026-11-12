@@ -55,28 +55,10 @@ def test_agents_appended_after_legacy_flags():
     assert cmd[-2:] == ["--agents", AGENTS_JSON]
 
 
-def test_unrestricted_tools_stay_unrestricted_with_agents():
-    cmd = build_command("s", {}, AGENTS)
-    assert "--allowedTools" not in cmd
-
-
-def _allowed(cmd: list[str]) -> str:
-    return cmd[cmd.index("--allowedTools") + 1]
-
-
-def test_delegation_tool_added_to_restricted_tools():
-    cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read,Bash(git *)"}, AGENTS)
-    assert _allowed(cmd) == "Read,Bash(git *),Task"
-
-
-@pytest.mark.parametrize("tools", ["Read,Task", "Task", "Agent,Read", "Read, Task", "Read,Task(triage)"])
-def test_delegation_tool_not_duplicated(tools):
+@pytest.mark.parametrize("tools", ["", "Read,Bash(git *)"])
+def test_allowed_tools_passed_through_with_agents(tools):
     cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": tools}, AGENTS)
-    assert _allowed(cmd) == tools
-
-
-def test_delegation_tool_not_added_without_agents():
-    assert _allowed(build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read"}, {})) == "Read"
+    assert cmd[:-2] == legacy_command("s", {"PIPOMETA_ALLOWED_TOOLS": tools})
 
 
 @pytest.mark.parametrize(
@@ -191,7 +173,7 @@ def test_subagent_events_traced_and_kept_out_of_artifact(fake_cli, run_worker):
     assert cli.stdin() == "Orchestrate."
     assert argv.count("Orchestrate.") == 1 and argv[argv.index("--system-prompt") + 1] == "Orchestrate."
     assert argv[argv.index("--agents") + 1] == AGENTS_JSON
-    assert argv[argv.index("--allowedTools") + 1] == "Read,Task"
+    assert argv[argv.index("--allowedTools") + 1] == "Read"
 
     by_type = _by_type(run.events)
     # The delegation call itself, from the main agent.
