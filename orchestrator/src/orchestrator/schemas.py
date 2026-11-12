@@ -1,9 +1,12 @@
 from datetime import datetime
+from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from orchestrator.models import RunStatus
+
+INPUT_URI_SCHEMES = ("s3", "https")
 
 
 class PipelineCreate(BaseModel):
@@ -33,6 +36,16 @@ class RunTrigger(BaseModel):
     idempotency_key: str | None = None
     parameters: dict = Field(default_factory=dict)
 
+    @field_validator("input_uri")
+    @classmethod
+    def _supported_scheme(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+        if urlsplit(value).scheme not in INPUT_URI_SCHEMES:
+            raise ValueError("input_uri must be an s3:// or https:// URI")
+        return value
+
 
 class RunRead(BaseModel):
     id: UUID
@@ -49,6 +62,11 @@ class RunRead(BaseModel):
     last_heartbeat_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("input_uri")
+    def _without_query(self, value: str | None) -> str | None:
+        # Why: a presigned URL carries its signature in the query string.
+        return value and value.split("?", 1)[0]
 
 
 class EventIn(BaseModel):

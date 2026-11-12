@@ -11,9 +11,12 @@ import io
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import boto3
+import httpx
 
 from worker.client import OrchestratorClient
 
@@ -42,8 +45,88 @@ async def _heartbeat_task(client: OrchestratorClient, stop: asyncio.Event) -> No
             pass
 
 
-def _read_prompt() -> str:
-    input_uri = os.environ.get("PIPOMETA_INPUT_URI")
+# Input bundles fetched over https (e.g. a presigned URL on the caller's own
+# bucket) are capped in size and total time so a wrong link can neither fill
+# the container's memory nor hold the single dispatch slot.
+_INPUT_MAX_BYTES = 50 * 1024 * 1024
+_INPUT_FETCH_TIMEOUT_S = 60
+
+
+def _redact_uri(uri: str) -> str:
+    """scheme://host/path only: no query (presigned URLs carry their signature
+    there), no fragment, no userinfo. Safe to put in errors and run events."""
+    try:
+        parts = urlsplit(uri)
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        return "<unparseable uri>"
+    if not parts.scheme:
+        return "<uri without scheme>"
+    return f"{parts.scheme}://{host}{parts.path}"
+
+
+async def _refuse_plain_http(request: httpx.Request) -> None:
+    # Why: the bundle is the agent's instructions; a redirect must not downgrade it to http.
+    if request.url.scheme != "https":
+        raise ValueError(f"input fetch refused a non-https location: {_redact_uri(str(request.url))}")
+
+
+async def _fetch_https(uri: str) -> str:
+    safe = _redact_uri(uri)
+    data = bytearray()
+    try:
+        async with (
+            asyncio.timeout(_INPUT_FETCH_TIMEOUT_S),
+            httpx.AsyncClient(
+                timeout=_INPUT_FETCH_TIMEOUT_S,
+                follow_redirects=True,
+                headers={"User-Agent": "pipometa-worker"},
+                event_hooks={"request": [_refuse_plain_http]},
+            ) as http,
+            http.stream("GET", uri) as resp,
+        ):
+            resp.raise_for_status()
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > _INPUT_MAX_BYTES:
+                raise ValueError(f"input too large ({declared} bytes > {_INPUT_MAX_BYTES}): {safe}")
+            async for chunk in resp.aiter_bytes():
+                data += chunk
+                if len(data) > _INPUT_MAX_BYTES:
+                    raise ValueError(f"input too large (> {_INPUT_MAX_BYTES} bytes): {safe}")
+    # `from None`: httpx exceptions carry the full signed URL.
+    except httpx.HTTPStatusError as e:
+        raise ValueError(f"input fetch failed (HTTP {e.response.status_code}): {safe}") from None
+    except TimeoutError, httpx.TimeoutException:
+        raise ValueError(f"input fetch timed out after {_INPUT_FETCH_TIMEOUT_S}s: {safe}") from None
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        raise ValueError(f"input fetch failed ({type(e).__name__}): {safe}") from None
+    return data.decode("utf-8-sig")
+
+
+def _fetch_s3(uri: str) -> str:
+    bucket, _, key = uri[5:].partition("/")
+    s3 = _s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8-sig")
+
+
+def _prompt_from_body(body: str) -> str:
+    """A JSON object's `prompt` key if present, the raw body otherwise."""
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if not isinstance(doc, dict) or "prompt" not in doc:
+        return body
+    prompt = doc["prompt"]
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("input bundle: `prompt` must be a non-empty string")
+    return prompt
+
+
+async def _read_prompt() -> str:
+    input_uri = (os.environ.get("PIPOMETA_INPUT_URI") or "").strip()
     if not input_uri:
         # No per-run input bundle: a self-contained pipeline carries its whole
         # task in the system prompt. Use it as the driving prompt so the CLI
@@ -55,15 +138,15 @@ def _read_prompt() -> str:
         if system_prompt:
             return system_prompt
         return "Say hello in 3 lines, in French. End with a haiku."
-    if not input_uri.startswith("s3://"):
-        raise ValueError(f"unsupported input uri scheme: {input_uri}")
-    bucket, _, key = input_uri[5:].partition("/")
-    s3 = _s3_client()
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
-    try:
-        return json.loads(body).get("prompt", body)
-    except json.JSONDecodeError:
-        return body
+    scheme = urlsplit(input_uri).scheme
+    if scheme == "s3":
+        body = await asyncio.to_thread(_fetch_s3, input_uri)
+    elif scheme == "https":
+        body = await _fetch_https(input_uri)
+    else:
+        # Plain http:// is refused: the bundle is the agent's instructions.
+        raise ValueError(f"unsupported input uri scheme (expected s3:// or https://): {_redact_uri(input_uri)}")
+    return _prompt_from_body(body)
 
 
 # Output formats a pipeline may declare (config.output_format) → (filename, content-type).
@@ -142,7 +225,7 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
         await client.event(seq, "started", {"pid": os.getpid()})
         seq += 1
 
-        prompt = _read_prompt()
+        prompt = await _read_prompt()
         await client.event(seq, "prompt_loaded", {"chars": len(prompt)})
         seq += 1
 
@@ -163,7 +246,6 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
             system_prompt,
             "--dangerously-skip-permissions",
             "-p",
-            prompt,
         ]
         if extra_tools := (os.environ.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
             cmd.extend(["--allowedTools", extra_tools])
@@ -176,13 +258,19 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
         # the API-key fallback path; unset would let some code paths re-resolve.
         env = dict(os.environ)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=10 * 1024 * 1024,
-        )
+        # Why: the prompt goes in on stdin, not argv: Linux caps a single
+        # argument at 128 KiB and input bundles can be far larger.
+        with tempfile.TemporaryFile() as prompt_file:
+            prompt_file.write(prompt.encode("utf-8"))
+            prompt_file.seek(0)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=prompt_file,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                limit=10 * 1024 * 1024,
+            )
         stderr_task = asyncio.create_task(_drain_stderr(proc.stderr, cli_stderr))
 
         try:

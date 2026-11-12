@@ -91,6 +91,7 @@ curl -X POST "$URL/pipelines" -H "Authorization: Bearer $API_KEY" -d '{
 curl -X POST "$URL/pipelines/<id>/runs" -H "Authorization: Bearer $API_KEY" -d '{
   "input_uri": "s3://pipometa/inputs/metabase-weekly/2026-w18.json"
 }'
+# input_uri accepte aussi une URL https:// (par ex. présignée sur votre propre bucket) ; http:// est refusé
 # → renvoie {id: <run_id>, status: "queued"}
 
 # 3) Surveiller

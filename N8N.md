@@ -61,7 +61,7 @@ Le nœud **Schedule Trigger** de n8n peut remplacer un Container cron Scaleway p
 
 ### Fournir un input
 
-Pour passer des données au run, uploadez d'abord un fichier sur `s3://pipometa/inputs/<pipeline>/...` (nœud S3 de n8n, endpoint `https://s3.fr-par.scw.cloud`) puis passez son URI dans `input_uri` au déclenchement. Le worker le lit en début de session.
+Pour passer des données au run, uploadez d'abord un fichier sur `s3://pipometa/inputs/<pipeline>/...` (nœud S3 de n8n, endpoint `https://s3.fr-par.scw.cloud`) puis passez son URI dans `input_uri` au déclenchement. Si le fichier vit sur un autre bucket, passez plutôt une URL `https://` présignée (le worker la télécharge telle quelle ; `http://` est refusé). Le worker le lit en début de session.
 
 ### Annuler
 

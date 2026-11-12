@@ -30,10 +30,17 @@ Migrations : Alembic. Sources dans `orchestrator/alembic/versions/`, première r
 
 1. Un trigger arrive sur `POST /pipelines/:id/runs` → une ligne `runs` est insérée avec `status='queued'`. L'endpoint déclenche aussi un `_dispatch_one()` best-effort en ligne pour que les triggers sensibles à la latence n'attendent pas le cron.
 2. **Pas de dispatch** (`dispatch.py:_dispatch_one`, advisory-lock, concurrence 1) : prend un run en file, génère un HMAC par run, récupère le token OAuth depuis Secret Manager, construit l'env du worker, appelle Scaleway Jobs `start`. Met le run à `running` avec le `scaleway_job_run_id` retourné.
-3. Le worker boote, matérialise `~/.claude.json` (bypass de l'onboarding), lance la CLI avec le system prompt et la config du pipeline, parse les events stream-json.
+3. Le worker boote, matérialise `~/.claude.json` (bypass de l'onboarding), lit l'entrée du run s'il y en a une (voir ci-dessous), lance la CLI avec le system prompt et la config du pipeline, parse les events stream-json.
 4. Le worker pousse les events sur `POST /runs/:id/events` (signés HMAC) et un heartbeat toutes les 30s sur `PUT /runs/:id/heartbeat`.
 5. Le worker upload l'artefact sur `s3://pipometa/runs/AAAA/MM/JJ/<pipeline>/<run_id>/output.md`, appelle `PUT /runs/:id/result`, sort de `main()`, le container s'éteint.
 6. **Pas de réconciliation** (`reconcile.py:_reconcile_once`) : pour tout run en `running`/`starting` sans heartbeat depuis >90s, interroge Scaleway Jobs et, si l'état y est terminal, met le run local en accord. C'est le filet de sécurité qui rattrape les workers sortis sans avoir reporté.
+
+**Contrat d'entrée (`input_uri`).** Optionnel. Deux schémas acceptés :
+
+- `s3://bucket/key`, lu avec les clés S3 du worker (donc sur un bucket qu'elles atteignent, en pratique `pipometa`) ;
+- `https://...`, téléchargé tel quel, avec une taille et une durée totale plafonnées, et des redirections suivies seulement vers du https. C'est la voie pour un appelant qui garde ses fichiers sur son propre bucket : il passe une URL présignée.
+
+`http://` en clair et tout autre schéma sont refusés dès le déclenchement (422). Le corps est lu en UTF-8 ; si c'est un objet JSON avec une clé `prompt`, sa valeur (une chaîne non vide) devient le prompt, sinon le corps brut est passé tel quel (JSONL compris). Le prompt n'a pas de limite de taille propre : il est transmis à la CLI sur son entrée standard. La query string qui porte la signature ne ressort ni dans les erreurs, qui ne recopient que `schéma://hôte/chemin`, ni dans les réponses de l'API ; elle reste stockée dans `runs.input_uri` et dans l'env du job worker. La colonne `runs.input_uri` est en `text` (migration `0002`) : une URL présignée dépasse vite les 512 caractères de départ.
 
 Dispatch et réconciliation sont tous deux pilotés par le Container cron à la minute (`POST /admin/tick`), plus le dispatch best-effort en ligne à la création du run.
 

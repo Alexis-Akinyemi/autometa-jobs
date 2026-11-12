@@ -42,7 +42,7 @@ jobsctl trigger <pipeline-id>
 
 La sortie contient l'`id` du run ; c'est lui qu'on suit.
 
-> Sans option, le run démarre en mode **one-shot** : la tâche entière est dans la consigne du pipeline. Pour un pipeline **réutilisable** qui attend une entrée, ajoutez `--input-uri s3://pipometa/inputs/.../mon-fichier.json` — ce fichier (un JSON avec une clé `prompt`) est la donnée que l'agent traite.
+> Sans option, le run démarre en mode **one-shot** : la tâche entière est dans la consigne du pipeline. Pour un pipeline **réutilisable** qui attend une entrée, ajoutez `--input-uri s3://pipometa/inputs/.../mon-fichier.json` — ce fichier (un JSON avec une clé `prompt`, sinon son contenu brut) est la donnée que l'agent traite. `input_uri` accepte aussi une URL `https://`, par exemple une URL présignée sur votre propre bucket ; `http://` en clair est refusé.
 
 Le run démarre généralement dans la seconde (`queued` → `running`) ; sinon une tâche de fond le rattrape dans la minute.
 

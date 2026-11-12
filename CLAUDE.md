@@ -94,10 +94,10 @@ autometa-jobs/
 Trois tables qui comptent (une quatrième, `schedules`, est réservée pour la v2) :
 
 - **`pipelines(id, name, system_prompt, config_jsonb)`** — `config_jsonb` porte `{scaleway_job_definition_id, allowed_tools, max_turns, model, output_format, ...}`. `output_format` (`md` par défaut, ou `csv`/`json`/`txt`) décide du nom et du content-type de l'artefact : le worker écrit `output.<ext>` et l'endpoint `/runs/:id/output` le sert tel quel. Le format ne transforme pas le contenu — c'est au system prompt d'émettre du CSV/JSON propre (cf. composer).
-- **`runs(id, pipeline_id, status, scaleway_job_run_id, input_uri, output_uri, summary, hmac_key, last_heartbeat_at, ...)`** — le statut est l'un de `queued | starting | running | completed | failed | cancelled | timed_out | quota_blocked`.
+- **`runs(id, pipeline_id, status, scaleway_job_run_id, input_uri, output_uri, summary, hmac_key, last_heartbeat_at, ...)`** — `input_uri` est `s3://bucket/key` ou une URL `https://` (présignée), jamais `http://` ; contrat dans [ARCHITECTURE.md § Cycle de vie](ARCHITECTURE.md#cycle-de-vie-dun-run). Le statut est l'un de `queued | starting | running | completed | failed | cancelled | timed_out | quota_blocked`.
 - **`run_events(id, run_id, seq, event_type, payload_jsonb)`** — journal append-only de la session. Le worker y écrit les events au fil de l'eau (started, prompt_loaded, assistant_message, tool_result, result, error, etc.).
 
-Migrations : Alembic, sources dans `orchestrator/alembic/versions/`. Première révision : `0001_initial.py`. À appliquer avec `infra/05-init-db.sh` (qui lance `alembic upgrade head`).
+Migrations : Alembic, sources dans `orchestrator/alembic/versions/`. Première révision : `0001_initial.py` ; `0002` élargit `runs.input_uri` en `text`. À appliquer avec `infra/05-init-db.sh` (qui lance `alembic upgrade head`).
 
 ## Workflows courants
 
@@ -209,6 +209,14 @@ docker build --platform linux/amd64 \
 docker push rg.fr-par.scw.cloud/nova-container-registry/pipometa-orchestrator:latest
 scw container container redeploy $PIPOMETA_CONTAINER_ID region=$PIPOMETA_REGION
 ```
+
+### Tests
+
+```sh
+uv run --locked --directory worker --with pytest-mock pytest -q tests   # ou orchestrator
+```
+
+La CI les lance avant tout build ou déploiement.
 
 ### Dépendances (lockfiles)
 
