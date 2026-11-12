@@ -270,8 +270,8 @@ def build_command(system_prompt: str, env: Mapping[str, str], agents: dict) -> l
 
 
 # Keys of the CLI's background-task system events (task_started,
-# task_progress, task_updated, task_notification) worth keeping for tracing
-# sub-agent runs. Prompts and output file paths are left out.
+# task_updated, task_notification) worth keeping for tracing sub-agent runs.
+# Prompts and output file paths are left out.
 _TASK_EVENT_KEYS = (
     "task_id",
     "tool_use_id",
@@ -294,7 +294,7 @@ def _system_event_payload(ev: dict) -> dict:
     elif str(ev.get("subtype") or "").startswith("task_"):
         for key in _TASK_EVENT_KEYS:
             if key in ev:
-                payload[key] = ev[key]
+                payload[key] = ev[key][:2000] if isinstance(ev[key], str) else ev[key]
     return payload
 
 
@@ -503,8 +503,10 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                     seq += 1
                 elif ev_type == "system":
                     deliverable.on_system(ev)
-                    await client.event(seq, "system", _system_event_payload(ev))
-                    seq += 1
+                    # Why: progress events repeat what the sub-agent's own messages already trace.
+                    if ev.get("subtype") != "task_progress":
+                        await client.event(seq, "system", _system_event_payload(ev))
+                        seq += 1
                     if ev.get("subtype") == "init" and agents and not init_checked:
                         init_checked = True
                         if unlisted := _unlisted_tools(ev, agents):

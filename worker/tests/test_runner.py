@@ -328,3 +328,12 @@ def test_unlisted_subagent_tools_are_reported(fake_cli, run_worker, spec, unlist
 
 def test_unlisted_tools_not_judged_without_a_tool_list():
     assert runner._unlisted_tools({"agents": ["echoer"]}, {"echoer": {"tools": ["WebFech"]}}) == {}
+
+
+def test_task_progress_dropped_and_summaries_truncated(fake_cli, run_worker):
+    notification = {"type": "system", "subtype": "task_notification", "task_id": "t1", "summary": "s" * 5000}
+    fake_cli(RECORDED_STREAM.read_text() + _stream(notification))
+    run = run_worker(PIPOMETA_AGENTS=json.dumps(ECHOER))
+    subtypes = [p["subtype"] for t, p in run.events if t == "system"]
+    assert "task_started" in subtypes and "task_progress" not in subtypes
+    assert len([p for t, p in run.events if t == "system"][-1]["summary"]) == 2000
