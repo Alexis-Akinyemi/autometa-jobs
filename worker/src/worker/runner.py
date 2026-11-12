@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -245,7 +246,6 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
             system_prompt,
             "--dangerously-skip-permissions",
             "-p",
-            prompt,
         ]
         if extra_tools := (os.environ.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
             cmd.extend(["--allowedTools", extra_tools])
@@ -258,13 +258,19 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
         # the API-key fallback path; unset would let some code paths re-resolve.
         env = dict(os.environ)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=10 * 1024 * 1024,
-        )
+        # Why: the prompt goes in on stdin, not argv: Linux caps a single
+        # argument at 128 KiB and input bundles can be far larger.
+        with tempfile.TemporaryFile() as prompt_file:
+            prompt_file.write(prompt.encode("utf-8"))
+            prompt_file.seek(0)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=prompt_file,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                limit=10 * 1024 * 1024,
+            )
         stderr_task = asyncio.create_task(_drain_stderr(proc.stderr, cli_stderr))
 
         try:
