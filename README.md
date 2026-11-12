@@ -93,7 +93,25 @@ jobsctl pipeline-create \
 ```
 
 - `--system-prompt` / `--system-prompt-file` — la consigne permanente de l'agent (voir le template ci-dessous).
-- `--config` / `--config-file` — la config JSON. `allowed_tools` : les outils autorisés (liste vide pour tout interdire) ; `scaleway_job_definition_id` : identifiant technique constant, demandez-le une fois à qui gère l'infra.
+- `--config` / `--config-file` — la config JSON. `allowed_tools` : les outils autorisés (liste vide pour tout interdire) ; `scaleway_job_definition_id` : identifiant technique constant, demandez-le une fois à qui gère l'infra ; `agents` (optionnel) : des sous-agents Claude natifs, voir ci-dessous.
+
+### Sous-agents (optionnel)
+
+`config.agents` déclare des sous-agents Claude natifs : l'agent principal orchestre et leur délègue des tâches, chacune sur le modèle qui convient (Haiku pour extraire, Sonnet pour raisonner). Format de l'option `--agents` de la CLI :
+
+```json
+"agents": {
+  "extracteur": {
+    "description": "Lit une page web et en extrait les faits utiles. À utiliser pour chaque URL.",
+    "prompt": "Tu rends une liste de faits courts, chacun avec sa citation source.",
+    "model": "haiku",
+    "tools": ["WebFetch"],
+    "maxTurns": 6
+  }
+}
+```
+
+`description` et `prompt` sont obligatoires ; `model` vaut `haiku`, `sonnet`, `opus` ou `inherit` ; `tools`, `disallowedTools` et `maxTurns` (1 à 200) sont optionnels. Toute autre clé est refusée. 8 sous-agents max, 32 Kio max. `max_turns` du pipeline ne borne que l'agent principal : bornez chaque sous-agent par son `maxTurns`. Les sous-agents tournent en arrière-plan : demandez dans la consigne de n'écrire la réponse finale qu'une fois tous leurs résultats reçus, sans commenter l'attente. Exemple complet : [`pipelines/subagents-demo.json`](pipelines/subagents-demo.json). Détails : [ARCHITECTURE.md § Sous-agents natifs](ARCHITECTURE.md#sous-agents-natifs).
 
 Pour ajuster un pipeline existant, ne passez que ce qui change :
 
@@ -147,7 +165,7 @@ Pour un gros livrable, dites-le donc explicitement dans la consigne :
 
 - **Produire par lots, sur plusieurs tours.** Ex. « traite les éléments par lots de 12 ; après chaque lot, lance un `echo` Bash trivial avant d'enchaîner ». Ce point de contrôle clôt le message courant et garde chaque réponse sous le plafond ; le worker recolle tout.
 - **Émettre le contenu dans le texte des messages**, pas sur le disque. Pour un CSV, un bloc ` ```csv ` ouvert au premier lot et fermé au dernier (les lots intermédiaires n'ajoutent que des lignes, sans rouvrir la balise ni répéter l'en-tête) se concatène en un bloc continu et propre.
-- **Interdire les sous-agents** si leur production doit finir dans l'artefact : « ne délègue pas à un sous-agent, produis tout toi-même ».
+- **Interdire les sous-agents** si leur production doit finir dans l'artefact : « ne délègue pas à un sous-agent, produis tout toi-même ». Ou, avec des sous-agents déclarés (`agents`), faire recopier par l'agent principal ce qui doit figurer dans le livrable.
 - Dimensionnez `max_turns` en conséquence (1 tour d'en-tête + 1 par lot + une marge).
 
 Le bloc **ENTRÉE** dépend du mode visé (voir [Concepts fondamentaux](#concepts-fondamentaux)) :

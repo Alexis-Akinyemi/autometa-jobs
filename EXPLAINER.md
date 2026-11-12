@@ -38,9 +38,11 @@ Un pipeline est une ligne en Postgres avec trois choses :
 
 - **un nom** (`hello`, `metabase-weekly`, …)
 - **un system prompt** (qui est l'agent, comment il doit se comporter)
-- **une config** (max_turns, outils autorisés, modèle, l'identifiant de la job-definition du worker)
+- **une config** (max_turns, outils autorisés, modèle, l'identifiant de la job-definition du worker, et en option des sous-agents)
 
 Déclencher un pipeline crée un *run*. Un run a un statut (`queued → running → completed / failed / cancelled / timed_out / quota_blocked`), un journal d'événements en append-only, et exactement un artefact à la fin.
+
+**Sous-agents.** Un pipeline peut déclarer dans sa config (`agents`) des sous-agents Claude natifs : chacun a une description (quand l'utiliser), un prompt, un modèle et ses outils. L'agent principal orchestre et leur délègue des morceaux de travail, par exemple Haiku pour extraire ou trier, Sonnet pour raisonner. Intérêt : le contexte de l'agent principal ne se remplit que des comptes rendus, et chaque tâche tourne sur le modèle qui lui convient. Tout reste dans le container, sur l'abonnement. Détails et limites : [ARCHITECTURE.md § Sous-agents natifs](ARCHITECTURE.md#sous-agents-natifs) ; exemple : `pipelines/subagents-demo.json`.
 
 La même image worker sert tous les pipelines. Le comportement spécifique à chaque pipeline tient uniquement aux variables d'environnement que l'orchestrateur injecte au démarrage du Job. Donc ajouter un nouveau pipeline ne demande pas de rebuilder l'image.
 
@@ -117,12 +119,12 @@ Pour planifier un run récurrent, attachez un Container cron Scaleway à un `POS
 
 1. **Où vit le token OAuth** : Secret Manager `pipometa-claude-oauth-token`. Rotation via `claude setup-token`, on pousse la nouvelle valeur avec `infra/02-secrets.sh`.
 2. **Où se passe le dispatch** : `orchestrator/src/orchestrator/dispatch.py:_dispatch_one`. Un run en file par appel, atomique, advisory-locked.
-3. **Ce que le worker lit dans l'env** : `PIPOMETA_RUN_ID`, `PIPOMETA_RUN_HMAC_KEY`, `PIPOMETA_ORCHESTRATOR_URL`, `PIPOMETA_INPUT_URI`, `PIPOMETA_OUTPUT_BUCKET`, `PIPOMETA_SYSTEM_PROMPT`, `PIPOMETA_ALLOWED_TOOLS`, `PIPOMETA_MAX_TURNS`, `PIPOMETA_MODEL`, `CLAUDE_CODE_OAUTH_TOKEN`, `AWS_*`. Tout est injecté au démarrage du Job.
+3. **Ce que le worker lit dans l'env** : `PIPOMETA_RUN_ID`, `PIPOMETA_RUN_HMAC_KEY`, `PIPOMETA_ORCHESTRATOR_URL`, `PIPOMETA_INPUT_URI`, `PIPOMETA_OUTPUT_BUCKET`, `PIPOMETA_SYSTEM_PROMPT`, `PIPOMETA_ALLOWED_TOOLS`, `PIPOMETA_MAX_TURNS`, `PIPOMETA_MODEL`, `PIPOMETA_AGENTS` (seulement si le pipeline déclare des sous-agents), `CLAUDE_CODE_OAUTH_TOKEN`, `AWS_*`. Tout est injecté au démarrage du Job.
 4. **Où regarder quand quelque chose ne va pas** : Postgres `runs.error_text` et `run_events` d'abord. Cockpit pour les logs complets du container. Console Scaleway → Jobs → run id pour le code de sortie du worker.
 5. **Ce qui coûte de l'argent en continu** : seulement le container de l'orchestrateur (~5 €/mois) et l'instance Postgres existante (déjà payée). Les workers coûtent quelques centimes par run au-delà du free tier.
 
 ## Ce qui est volontairement absent
 
-Webhooks, registre de serveurs MCP, packaging de skills, orchestration de sous-agents, UI web, multi-locataire, reprogrammation au changement de fenêtre quota. Tout ça est raisonnable comme add-on v2 ; rien ne bloque l'usage actuel.
+Webhooks, registre de serveurs MCP, packaging de skills, délégation à de petits modèles externes (voir Autometa #292), UI web, multi-locataire, reprogrammation au changement de fenêtre quota. Tout ça est raisonnable comme add-on v2 ; rien ne bloque l'usage actuel.
 
 Si vous vous trouvez à vouloir plus que ça, la bonne suite est probablement (a) un vrai deuxième pipeline qui justifie une nouvelle feature, ou (b) basculer sur Claude Managed Agents tout court, qui a tout ce qui précède. autometa-jobs gagne sa place parce qu'il vous appartient et qu'il tourne sur l'abonnement, pas sur l'API. Si l'abonnement cesse d'être structurant, l'arbitrage build-vs-buy s'inverse.
