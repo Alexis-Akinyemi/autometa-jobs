@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -210,6 +211,108 @@ def _parse_assistant_blocks(event: dict) -> tuple[list[dict], list[str]]:
     return blocks, text_parts
 
 
+# Name of the CLI's delegation tool. Current CLIs emit it as "Agent" in
+# stream-json; "Task" is the historical name and is still accepted in
+# --allowedTools. Either name present in the list counts.
+DELEGATION_TOOL = "Task"
+_DELEGATION_TOOL_NAMES = {"Task", "Agent"}
+
+
+class AgentsConfigError(ValueError):
+    pass
+
+
+def _load_agents(raw: str) -> str:
+    """Check PIPOMETA_AGENTS and return the JSON to pass to `claude --agents`.
+
+    The orchestrator already validated it against the full schema; this is a
+    last structural check so a corrupt value fails the run loudly instead of
+    starting a session silently stripped of its sub-agents.
+    """
+    try:
+        agents = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise AgentsConfigError(f"PIPOMETA_AGENTS is not valid JSON: {e}") from None
+    if not isinstance(agents, dict) or not agents:
+        raise AgentsConfigError("PIPOMETA_AGENTS must be a non-empty JSON object keyed by agent name")
+    for name, spec in agents.items():
+        if not isinstance(spec, dict):
+            raise AgentsConfigError(f"PIPOMETA_AGENTS[{name!r}] must be an object")
+        for key in ("description", "prompt"):
+            if not isinstance(spec.get(key), str) or not spec[key].strip():
+                raise AgentsConfigError(f"PIPOMETA_AGENTS[{name!r}].{key} must be a non-empty string")
+    return raw
+
+
+def _with_delegation_tool(allowed_tools: str) -> str:
+    """Make sure the delegation tool is in a restricted --allowedTools list."""
+    names = {entry.strip().split("(", 1)[0] for entry in allowed_tools.split(",")}
+    if names & _DELEGATION_TOOL_NAMES:
+        return allowed_tools
+    return f"{allowed_tools},{DELEGATION_TOOL}"
+
+
+def build_command(system_prompt: str, env: Mapping[str, str]) -> list[str]:
+    """argv for the claude CLI (the prompt goes in on stdin).
+
+    Without PIPOMETA_AGENTS it is the historical command, unchanged.
+    """
+    # Worker container runs as non-root `runner`, so the CLI accepts
+    # --dangerously-skip-permissions. The container itself is the security
+    # boundary (gVisor sandbox, ephemeral); inside, the agent should have
+    # full freedom. Per-pipeline tool restrictions can be added via
+    # PIPOMETA_ALLOWED_TOOLS if needed.
+    cmd = [
+        CLAUDE_BIN,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--system-prompt",
+        system_prompt,
+        "--dangerously-skip-permissions",
+        "-p",
+    ]
+    agents_raw = (env.get("PIPOMETA_AGENTS") or "").strip()
+    agents = _load_agents(agents_raw) if agents_raw else None
+    if extra_tools := (env.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
+        if agents:
+            extra_tools = _with_delegation_tool(extra_tools)
+        cmd.extend(["--allowedTools", extra_tools])
+    if max_turns := (env.get("PIPOMETA_MAX_TURNS") or "").strip():
+        cmd.extend(["--max-turns", max_turns])
+    if model := (env.get("PIPOMETA_MODEL") or "").strip():
+        cmd.extend(["--model", model])
+    if agents:
+        cmd.extend(["--agents", agents])
+    return cmd
+
+
+# Keys of the CLI's background-task system events (task_started,
+# task_progress, task_updated, task_notification) worth keeping for tracing
+# sub-agent runs. Prompts and output file paths are left out.
+_TASK_EVENT_KEYS = (
+    "task_id",
+    "tool_use_id",
+    "description",
+    "subagent_type",
+    "task_type",
+    "is_backgrounded",
+    "spawn_depth",
+    "status",
+    "summary",
+    "usage",
+)
+
+
+def _system_event_payload(ev: dict) -> dict:
+    payload = {"subtype": ev.get("subtype"), "message": ev.get("message")}
+    if str(ev.get("subtype") or "").startswith("task_"):
+        for key in _TASK_EVENT_KEYS:
+            if key in ev:
+                payload[key] = ev[key]
+    return payload
+
+
 async def run_pipeline(cancelled: asyncio.Event) -> int:
     client = OrchestratorClient()
     stop = asyncio.Event()
@@ -232,27 +335,7 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
         system_prompt = (os.environ.get("PIPOMETA_SYSTEM_PROMPT") or "").strip() or (
             "You are a focused assistant. Be concise."
         )
-        # Worker container runs as non-root `runner`, so the CLI accepts
-        # --dangerously-skip-permissions. The container itself is the security
-        # boundary (gVisor sandbox, ephemeral); inside, the agent should have
-        # full freedom. Per-pipeline tool restrictions can be added via
-        # PIPOMETA_ALLOWED_TOOLS if needed.
-        cmd = [
-            CLAUDE_BIN,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--system-prompt",
-            system_prompt,
-            "--dangerously-skip-permissions",
-            "-p",
-        ]
-        if extra_tools := (os.environ.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
-            cmd.extend(["--allowedTools", extra_tools])
-        if max_turns := (os.environ.get("PIPOMETA_MAX_TURNS") or "").strip():
-            cmd.extend(["--max-turns", max_turns])
-        if model := (os.environ.get("PIPOMETA_MODEL") or "").strip():
-            cmd.extend(["--model", model])
+        cmd = build_command(system_prompt, os.environ)
         # Pass the env through unchanged. Dispatch sets ANTHROPIC_API_KEY="" so
         # the CLI sees an explicit empty value rather than nothing — empty blocks
         # the API-key fallback path; unset would let some code paths re-resolve.
@@ -295,25 +378,33 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                     continue
 
                 ev_type = ev.get("type")
+                # Messages produced inside a sub-agent carry the id of the
+                # delegating tool_use; the main agent's own messages carry none.
+                parent_id = ev.get("parent_tool_use_id")
                 if ev_type == "assistant":
                     blocks, parts = _parse_assistant_blocks(ev)
                     if blocks:
-                        await client.event(seq, "assistant_message", {"blocks": blocks})
+                        payload = {"blocks": blocks}
+                        if parent_id:
+                            payload["parent_tool_use_id"] = parent_id
+                        await client.event(seq, "assistant_message", payload)
                         seq += 1
-                    final_text_parts.extend(parts)
+                    # The artifact is the main agent's text only; a sub-agent's
+                    # text reaches the main agent as a tool result.
+                    if not parent_id:
+                        final_text_parts.extend(parts)
                 elif ev_type == "user":
                     msg = ev.get("message", {}) or {}
                     for block in msg.get("content", []) or []:
                         if block.get("type") == "tool_result":
                             content = block.get("content", "")
-                            await client.event(
-                                seq,
-                                "tool_result",
-                                {
-                                    "tool_use_id": block.get("tool_use_id"),
-                                    "content": str(content)[:2000],
-                                },
-                            )
+                            payload = {
+                                "tool_use_id": block.get("tool_use_id"),
+                                "content": str(content)[:2000],
+                            }
+                            if parent_id:
+                                payload["parent_tool_use_id"] = parent_id
+                            await client.event(seq, "tool_result", payload)
                             seq += 1
                 elif ev_type == "result":
                     token_usage = {
@@ -324,10 +415,14 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                         "usage": ev.get("usage"),
                         "subtype": ev.get("subtype"),
                     }
+                    # Per-model usage and sub-agent counters, when the CLI reports them.
+                    for key in ("modelUsage", "subagent_stats"):
+                        if ev.get(key) is not None:
+                            token_usage[key] = ev[key]
                     await client.event(seq, "result", token_usage)
                     seq += 1
                 elif ev_type == "system":
-                    await client.event(seq, "system", {"subtype": ev.get("subtype"), "message": ev.get("message")})
+                    await client.event(seq, "system", _system_event_payload(ev))
                     seq += 1
                 elif ev_type == "error":
                     await client.event(seq, "claude_error", ev)
