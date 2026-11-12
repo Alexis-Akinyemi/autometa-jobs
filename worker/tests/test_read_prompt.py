@@ -1,16 +1,12 @@
-"""Unit tests for runner._read_prompt: s3:// and https:// input bundles.
+"""runner._read_prompt: s3:// and https:// input bundles, without network."""
 
-Run with: uv run --directory worker --with pytest pytest -q tests
-No network: S3 and the https opener are replaced by fakes.
-"""
-
+import asyncio
 import io
 import json
-import os
-import unittest
-import urllib.error
-from email.message import Message
-from unittest import mock
+import traceback
+
+import httpx
+import pytest
 
 from worker import runner
 
@@ -22,153 +18,166 @@ SIGNED = (
 SAFE = "https://bucket.example.test/job-inputs/run.jsonl"
 
 
-class _FakeResponse(io.BytesIO):
-    def __init__(self, data: bytes, content_length: str | None = None):
-        super().__init__(data)
-        self.headers = Message()
-        if content_length is not None:
-            self.headers["Content-Length"] = content_length
+def _read(monkeypatch, uri: str) -> str:
+    monkeypatch.setenv("PIPOMETA_INPUT_URI", uri)
+    return asyncio.run(runner._read_prompt())
 
 
-class _FakeOpener:
-    def __init__(self, response=None, exc=None):
-        self.response = response
-        self.exc = exc
-        self.calls = []
-
-    def open(self, req, timeout=None):
-        self.calls.append((req.full_url, timeout))
-        if self.exc is not None:
-            raise self.exc
-        return self.response
+def _serve(mocker, handler):
+    """Route the worker's httpx client to `handler` instead of the network."""
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    return mocker.patch.object(
+        runner.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=transport, **kw)
+    )
 
 
-def _env(uri: str):
-    return mock.patch.dict(os.environ, {"PIPOMETA_INPUT_URI": uri})
+def _body(content, **headers):
+    return lambda request: httpx.Response(200, content=content, headers=headers)
 
 
-class S3InputTest(unittest.TestCase):
-    def _s3(self, body: bytes):
-        s3 = mock.Mock()
-        s3.get_object.return_value = {"Body": io.BytesIO(body)}
-        return mock.patch.object(runner, "_s3_client", return_value=s3), s3
+def _refuse(exc):
+    def handler(request):
+        raise exc
 
-    def test_json_prompt_key(self):
-        patcher, s3 = self._s3(json.dumps({"prompt": "question"}).encode())
-        with patcher, _env("s3://pipometa/inputs/x/in.json"):
-            self.assertEqual(runner._read_prompt(), "question")
-        s3.get_object.assert_called_once_with(Bucket="pipometa", Key="inputs/x/in.json")
-
-    def test_raw_body_fallback(self):
-        patcher, _ = self._s3(b"not json at all")
-        with patcher, _env("s3://pipometa/in.txt"):
-            self.assertEqual(runner._read_prompt(), "not json at all")
+    return handler
 
 
-class HttpsInputTest(unittest.TestCase):
-    def _run(self, opener):
-        with mock.patch.object(runner, "_HTTPS_OPENER", opener), _env(SIGNED):
-            return runner._read_prompt()
-
-    def test_json_prompt_key(self):
-        opener = _FakeOpener(_FakeResponse(json.dumps({"prompt": "q"}).encode()))
-        self.assertEqual(self._run(opener), "q")
-        url, timeout = opener.calls[0]
-        self.assertEqual(url, SIGNED)  # the full signed URL is what gets fetched
-        self.assertEqual(timeout, runner._INPUT_HTTP_TIMEOUT_S)
-
-    def test_jsonl_body_returned_raw(self):
-        body = '{"a": 1}\n{"a": 2}\n'
-        self.assertEqual(self._run(_FakeOpener(_FakeResponse(body.encode()))), body)
-
-    def test_json_non_object_returned_raw(self):
-        self.assertEqual(self._run(_FakeOpener(_FakeResponse(b"[1, 2]"))), "[1, 2]")
-
-    def test_http_error_hides_query(self):
-        exc = urllib.error.HTTPError(SIGNED, 403, "Forbidden", Message(), None)
-        with self.assertRaises(ValueError) as ctx:
-            self._run(_FakeOpener(exc=exc))
-        msg = str(ctx.exception)
-        self.assertIn("HTTP 403", msg)
-        self.assertIn(SAFE, msg)
-        self.assertNotIn("?", msg)
-        self.assertNotIn("Signature", msg)
-        self.assertIsNone(ctx.exception.__cause__)
-        self.assertTrue(ctx.exception.__suppress_context__)
-
-    def test_url_error_hides_query(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(_FakeOpener(exc=urllib.error.URLError(OSError("boom"))))
-        self.assertNotIn("Signature", str(ctx.exception))
-        self.assertIn(SAFE, str(ctx.exception))
-
-    def test_timeout(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(_FakeOpener(exc=TimeoutError()))
-        self.assertIn("timed out", str(ctx.exception))
-        self.assertNotIn("Signature", str(ctx.exception))
-
-    def test_size_cap_from_body(self):
-        with mock.patch.object(runner, "_INPUT_MAX_BYTES", 10):
-            with self.assertRaises(ValueError) as ctx:
-                self._run(_FakeOpener(_FakeResponse(b"x" * 11)))
-        self.assertIn("too large", str(ctx.exception))
-        self.assertNotIn("Signature", str(ctx.exception))
-
-    def test_size_cap_from_content_length(self):
-        with mock.patch.object(runner, "_INPUT_MAX_BYTES", 10):
-            with self.assertRaises(ValueError) as ctx:
-                self._run(_FakeOpener(_FakeResponse(b"x", content_length="999")))
-        self.assertIn("too large", str(ctx.exception))
-
-    def test_exactly_at_cap_is_accepted(self):
-        with mock.patch.object(runner, "_INPUT_MAX_BYTES", 10):
-            self.assertEqual(self._run(_FakeOpener(_FakeResponse(b"x" * 10))), "x" * 10)
-
-    def test_redirect_to_http_refused(self):
-        handler = runner._HttpsOnlyRedirectHandler()
-        req = mock.Mock()
-        with self.assertRaises(ValueError) as ctx:
-            handler.redirect_request(req, None, 302, "Found", {}, "http://elsewhere.test/x?sig=secret")
-        self.assertNotIn("secret", str(ctx.exception))
+async def _cut_body():
+    yield b'{"prompt": "par'
+    raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
 
 
-class RefusedSchemesTest(unittest.TestCase):
-    def test_plain_http_refused_without_fetch(self):
-        opener = _FakeOpener(_FakeResponse(b"should not be read"))
-        with mock.patch.object(runner, "_HTTPS_OPENER", opener), _env(SIGNED.replace("https://", "http://", 1)):
-            with self.assertRaises(ValueError) as ctx:
-                runner._read_prompt()
-        self.assertEqual(opener.calls, [])
-        msg = str(ctx.exception)
-        self.assertIn("unsupported input uri scheme", msg)
-        self.assertIn("http://bucket.example.test/job-inputs/run.jsonl", msg)
-        self.assertNotIn("Signature", msg)
-
-    def test_unknown_scheme_refused_without_query(self):
-        with _env("ftp://user:pw@host.test/f.json?token=secret"):
-            with self.assertRaises(ValueError) as ctx:
-                runner._read_prompt()
-        msg = str(ctx.exception)
-        self.assertIn("ftp://host.test/f.json", msg)
-        self.assertNotIn("secret", msg)
-        self.assertNotIn("pw", msg)
+async def _slow_body():
+    yield b"x"
+    await asyncio.sleep(10)
+    yield b"y"
 
 
-class RedactUriTest(unittest.TestCase):
-    def test_strips_query_fragment_userinfo(self):
-        self.assertEqual(runner._redact_uri("https://u:p@h.test:8443/a/b?x=1#frag"), "https://h.test:8443/a/b")
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        (json.dumps({"prompt": "question"}).encode(), "question"),
+        (b"not json at all", "not json at all"),
+        (b'\xef\xbb\xbf{"prompt": "question"}', "question"),
+    ],
+)
+def test_s3_body(mocker, monkeypatch, body, expected):
+    s3 = mocker.patch.object(runner, "_s3_client").return_value
+    s3.get_object.return_value = {"Body": io.BytesIO(body)}
+    assert _read(monkeypatch, "s3://pipometa/inputs/x/in.json") == expected
+    s3.get_object.assert_called_once_with(Bucket="pipometa", Key="inputs/x/in.json")
 
-    def test_no_scheme(self):
-        self.assertEqual(runner._redact_uri("just-a-key?sig=1"), "<uri without scheme>")
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        (json.dumps({"prompt": "q"}).encode(), "q"),
+        (b'\xef\xbb\xbf{"prompt": "q"}', "q"),
+        (b'{"a": 1}\n{"a": 2}\n', '{"a": 1}\n{"a": 2}\n'),
+        (b"[1, 2]", "[1, 2]"),
+        (b'{"other": 1}', '{"other": 1}'),
+    ],
+)
+def test_https_body(mocker, monkeypatch, body, expected):
+    client = _serve(mocker, _body(body))
+    assert _read(monkeypatch, SIGNED) == expected
+    assert client.call_args.kwargs["timeout"] == runner._INPUT_FETCH_TIMEOUT_S
 
 
-class NoInputTest(unittest.TestCase):
-    def test_system_prompt_fallback_unchanged(self):
-        env = {"PIPOMETA_INPUT_URI": "", "PIPOMETA_DEFAULT_PROMPT": "", "PIPOMETA_SYSTEM_PROMPT": "do it"}
-        with mock.patch.dict(os.environ, env):
-            self.assertEqual(runner._read_prompt(), "do it")
+@pytest.mark.parametrize("uri", ["HTTPS://bucket.example.test/in.json", f"  {SIGNED}\n"])
+def test_https_scheme_is_case_and_space_tolerant(mocker, monkeypatch, uri):
+    _serve(mocker, _body(b"ok"))
+    assert _read(monkeypatch, uri) == "ok"
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_https_redirect_followed(mocker, monkeypatch):
+    def handler(request):
+        if request.url.host == "bucket.example.test":
+            return httpx.Response(302, headers={"Location": "https://mirror.example.test/run.jsonl"})
+        return httpx.Response(200, content=b"moved")
+
+    _serve(mocker, handler)
+    assert _read(monkeypatch, SIGNED) == "moved"
+
+
+@pytest.mark.parametrize(
+    "uri,handler,expected",
+    [
+        (SIGNED, lambda request: httpx.Response(403), "HTTP 403"),
+        (SIGNED, _refuse(httpx.ConnectError("boom")), "ConnectError"),
+        (SIGNED, _refuse(httpx.ReadTimeout("slow")), "timed out"),
+        (SIGNED, lambda request: httpx.Response(200, content=_cut_body()), "RemoteProtocolError"),
+        (SIGNED.replace("deadbeef", "dead\x01beef"), _body(b"unreached"), "InvalidURL"),
+        (
+            SIGNED,
+            lambda request: httpx.Response(302, headers={"Location": "http://elsewhere.test/x?X-Amz-Signature=s"}),
+            "non-https",
+        ),
+    ],
+)
+def test_https_failure_hides_signature(mocker, monkeypatch, uri, handler, expected):
+    _serve(mocker, handler)
+    with pytest.raises(ValueError, match=expected) as exc:
+        _read(monkeypatch, uri)
+    assert "Signature" not in "".join(traceback.format_exception(exc.value))
+
+
+def test_https_total_deadline(mocker, monkeypatch):
+    mocker.patch.object(runner, "_INPUT_FETCH_TIMEOUT_S", 0.05)
+    _serve(mocker, lambda request: httpx.Response(200, content=_slow_body()))
+    with pytest.raises(ValueError, match="timed out") as exc:
+        _read(monkeypatch, SIGNED)
+    assert SAFE in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [_body(b"x" * 11), _body(b"x", **{"Content-Length": "999"})],
+    ids=["body", "content-length"],
+)
+def test_https_size_cap(mocker, monkeypatch, handler):
+    mocker.patch.object(runner, "_INPUT_MAX_BYTES", 10)
+    _serve(mocker, handler)
+    with pytest.raises(ValueError, match="too large") as exc:
+        _read(monkeypatch, SIGNED)
+    assert "Signature" not in str(exc.value)
+
+
+def test_https_exactly_at_cap_is_accepted(mocker, monkeypatch):
+    mocker.patch.object(runner, "_INPUT_MAX_BYTES", 10)
+    _serve(mocker, _body(b"x" * 10))
+    assert _read(monkeypatch, SIGNED) == "x" * 10
+
+
+@pytest.mark.parametrize(
+    "uri,shown,hidden",
+    [
+        (SIGNED.replace("https://", "http://", 1), "http://bucket.example.test/job-inputs/run.jsonl", "Signature"),
+        ("ftp://user:pw@host.test/f.json?token=secret", "ftp://host.test/f.json", "secret"),
+    ],
+)
+def test_unsupported_scheme_refused_without_fetch(mocker, monkeypatch, uri, shown, hidden):
+    client = _serve(mocker, _body(b"should not be read"))
+    with pytest.raises(ValueError, match="unsupported input uri scheme") as exc:
+        _read(monkeypatch, uri)
+    client.assert_not_called()
+    assert shown in str(exc.value)
+    assert hidden not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "uri,expected",
+    [
+        ("https://u:p@h.test:8443/a/b?x=1#frag", "https://h.test:8443/a/b"),
+        ("just-a-key?sig=1", "<uri without scheme>"),
+    ],
+)
+def test_redact_uri(uri, expected):
+    assert runner._redact_uri(uri) == expected
+
+
+def test_no_input_falls_back_to_system_prompt(monkeypatch):
+    monkeypatch.setenv("PIPOMETA_DEFAULT_PROMPT", "")
+    monkeypatch.setenv("PIPOMETA_SYSTEM_PROMPT", "do it")
+    assert _read(monkeypatch, "") == "do it"
