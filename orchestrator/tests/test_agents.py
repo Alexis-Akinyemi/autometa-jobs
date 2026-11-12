@@ -1,10 +1,16 @@
+import asyncio
 import json
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from orchestrator.agents import MAX_AGENTS, MAX_AGENTS_JSON_BYTES, AgentsConfigError, normalize_agents
 from orchestrator.dispatch import agents_env_value, build_worker_env
+from orchestrator.models import RunStatus
 from orchestrator.schemas import PipelineCreate, PipelineUpdate
 from pydantic import ValidationError
+
+from orchestrator import dispatch
 
 TRIAGE = {
     "description": "Sorts raw records into categories. Use for bulk extraction.",
@@ -125,6 +131,7 @@ def _env(config: dict) -> dict[str, str]:
         pipeline_name="p",
         system_prompt="s",
         config=config,
+        agents=agents_env_value(config),
         oauth_token="tok",
     )
 
@@ -169,6 +176,22 @@ def test_env_with_agents_carries_compact_json():
 def test_dispatch_revalidates_stored_config():
     # A config written before validation existed (or edited in SQL) is refused at dispatch.
     with pytest.raises(AgentsConfigError, match="invalid config.agents"):
-        _env({"agents": {"Bad Name": ANALYST}})
+        agents_env_value({"agents": {"Bad Name": ANALYST}})
     with pytest.raises(AgentsConfigError, match="exceeds"):
         agents_env_value({"agents": {"a": {**ANALYST, "prompt": "x" * MAX_AGENTS_JSON_BYTES}}})
+
+
+def test_dispatch_fails_bad_agents_before_claiming_the_run(mocker):
+    run = SimpleNamespace(id=uuid4(), pipeline_id=uuid4(), status=RunStatus.queued, hmac_key=None)
+    stored = {"scaleway_job_definition_id": "job-def", "agents": {"Bad Name": ANALYST}}
+    session = mocker.AsyncMock()
+    session.execute.side_effect = [None, mocker.Mock(scalar_one_or_none=mocker.Mock(return_value=run))]
+    session.get.return_value = SimpleNamespace(name="p", system_prompt="s", config=stored)
+    mocker.patch.object(dispatch, "SessionLocal").return_value.__aenter__.return_value = session
+    read_secret = mocker.patch.object(dispatch.scaleway, "access_secret_value")
+
+    assert asyncio.run(dispatch._dispatch_one()) is True
+
+    read_secret.assert_not_called()
+    assert run.status == RunStatus.failed and run.hmac_key is None
+    assert "invalid config.agents" in run.error_text

@@ -41,6 +41,16 @@ async def _dispatch_one() -> bool:
         config = (pipeline.config or {}) if pipeline else {}
         pipeline_name = pipeline.name if pipeline else ""
 
+        # Before claiming the run: a bad stored config needs no secret and no Job.
+        try:
+            agents = agents_env_value(config)
+        except AgentsConfigError as e:
+            run.status = RunStatus.failed
+            run.error_text = str(e)
+            run.finished_at = datetime.now(timezone.utc)
+            await session.commit()
+            return True
+
         run.status = RunStatus.starting
         run.hmac_key = new_hmac_key()
         run.started_at = datetime.now(timezone.utc)
@@ -59,19 +69,16 @@ async def _dispatch_one() -> bool:
         await _mark_failed(run.id, "pipeline config missing scaleway_job_definition_id")
         return True
 
-    try:
-        env = build_worker_env(
-            run_id=str(run.id),
-            hmac_key=run.hmac_key or "",
-            input_uri=run.input_uri,
-            pipeline_name=pipeline_name,
-            system_prompt=(pipeline.system_prompt if pipeline else "") or "",
-            config=config,
-            oauth_token=oauth_token,
-        )
-    except AgentsConfigError as e:
-        await _mark_failed(run.id, str(e))
-        return True
+    env = build_worker_env(
+        run_id=str(run.id),
+        hmac_key=run.hmac_key or "",
+        input_uri=run.input_uri,
+        pipeline_name=pipeline_name,
+        system_prompt=(pipeline.system_prompt if pipeline else "") or "",
+        config=config,
+        agents=agents,
+        oauth_token=oauth_token,
+    )
 
     try:
         job_run = await scaleway.start_job(job_def_id, env)
@@ -130,6 +137,7 @@ def build_worker_env(
     pipeline_name: str,
     system_prompt: str,
     config: dict,
+    agents: str | None,
     oauth_token: str,
 ) -> dict[str, str]:
     """Environment injected into the worker Job for one run."""
@@ -166,6 +174,6 @@ def build_worker_env(
     }
     # Native Claude sub-agents (claude --agents). Only set when configured, so
     # a pipeline without agents gets exactly the environment it got before.
-    if (agents := agents_env_value(config)) is not None:
+    if agents is not None:
         env["PIPOMETA_AGENTS"] = agents
     return env
