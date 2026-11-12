@@ -29,8 +29,23 @@ jobs:
       - name: Lockfiles in sync with pyproject
         run: |
           for d in orchestrator worker jobsctl; do uv lock --check --directory "$d"; done
-      - run: ruff check orchestrator/src worker/src jobsctl/src
-      - run: ruff format --check orchestrator/src worker/src jobsctl/src
+      - run: ruff check orchestrator/src orchestrator/tests worker/src worker/tests jobsctl/src
+      - run: ruff format --check orchestrator/src orchestrator/tests worker/src worker/tests jobsctl/src
+
+  tests:
+    name: Tests (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [orchestrator, worker]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: uv run --locked --directory ${{ matrix.package }} --with pytest pytest -q tests
 
   security:
     name: Security
@@ -97,7 +112,7 @@ jobs:
   changes:
     name: Detect changed images
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: [lint, security, docker]
+    needs: [lint, tests, security, docker]
     runs-on: ubuntu-latest
     outputs:
       images: ${{ steps.detect.outputs.images }}

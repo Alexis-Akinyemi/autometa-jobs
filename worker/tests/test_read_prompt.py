@@ -1,6 +1,6 @@
 """Unit tests for runner._read_prompt: s3:// and https:// input bundles.
 
-Run with: uv run --directory worker python -m unittest discover -s tests
+Run with: uv run --directory worker --with pytest pytest -q tests
 No network: S3 and the https opener are replaced by fakes.
 """
 

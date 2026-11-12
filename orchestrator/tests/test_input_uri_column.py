@@ -1,6 +1,6 @@
 """runs.input_uri must hold presigned https URLs (well past 512 chars).
 
-Run with: uv run --directory orchestrator python -m unittest discover -s tests
+Run with: uv run --directory orchestrator --with pytest pytest -q tests
 The migration's round-trip against Postgres is checked by hand (see PR).
 """
 
