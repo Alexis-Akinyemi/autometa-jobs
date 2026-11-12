@@ -69,7 +69,9 @@ def upgrade() -> None:
     op.create_table(
         "run_events",
         sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
-        sa.Column("run_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("runs.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "run_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+        ),
         sa.Column("seq", sa.Integer, nullable=False),
         sa.Column("event_type", sa.String(64), nullable=False),
         sa.Column("payload_jsonb", postgresql.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),

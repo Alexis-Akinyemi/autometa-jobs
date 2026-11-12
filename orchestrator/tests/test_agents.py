@@ -81,6 +81,9 @@ def test_max_agent_count_is_accepted():
         ({"a": {**ANALYST, "model": "claude-haiku-5-5"}}, "a.model"),
         ({"a": {**ANALYST, "maxTurns": 0}}, "a.maxTurns"),
         ({"a": {**ANALYST, "maxTurns": 10_000}}, "a.maxTurns"),
+        ({"a": {**ANALYST, "maxTurns": True}}, "a.maxTurns"),
+        ({"a": {**ANALYST, "maxTurns": "5"}}, "a.maxTurns"),
+        ({"a": {**ANALYST, "maxTurns": 5.0}}, "a.maxTurns"),
         ({"a": {**ANALYST, "max_turns": 5}}, "a.max_turns"),  # typo of a CLI key: refused, not ignored
         ({"a": {**ANALYST, "tools": "Bash"}}, "a.tools"),
         ({"a": {**ANALYST, "tools": [" "]}}, "blank"),

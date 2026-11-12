@@ -15,7 +15,7 @@ import json
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, StrictInt, ValidationError, field_validator
 
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,63}$"
 MAX_AGENTS = 8
@@ -43,7 +43,8 @@ class AgentSpec(BaseModel):
     model: AgentModel | None = None
     tools: list[str] | None = None
     disallowedTools: list[str] | None = None  # noqa: N815 - CLI key
-    maxTurns: int | None = Field(default=None, ge=1, le=MAX_SUBAGENT_TURNS)  # noqa: N815 - CLI key
+    # Strict: `true` or "5" would otherwise be coerced into a silent 1 or 5.
+    maxTurns: StrictInt | None = Field(default=None, ge=1, le=MAX_SUBAGENT_TURNS)  # noqa: N815 - CLI key
 
     @field_validator("description", "prompt")
     @classmethod
