@@ -38,9 +38,9 @@ Migrations : Alembic. Sources dans `orchestrator/alembic/versions/`, première r
 **Contrat d'entrée (`input_uri`).** Optionnel. Deux schémas acceptés :
 
 - `s3://bucket/key`, lu avec les clés S3 du worker (donc sur un bucket qu'elles atteignent, en pratique `pipometa`) ;
-- `https://...`, téléchargé tel quel (stdlib, timeout 60 s, 50 Mo max, redirections suivies seulement vers du https). C'est la voie pour un appelant qui garde ses fichiers sur son propre bucket : il passe une URL présignée.
+- `https://...`, téléchargé tel quel, avec une taille et une durée totale plafonnées, et des redirections suivies seulement vers du https. C'est la voie pour un appelant qui garde ses fichiers sur son propre bucket : il passe une URL présignée.
 
-`http://` en clair et tout autre schéma sont refusés. Le corps est lu en UTF-8 ; si c'est un objet JSON avec une clé `prompt`, sa valeur devient le prompt, sinon le corps brut est passé tel quel (JSONL compris). Les erreurs ne recopient que `schéma://hôte/chemin`, jamais la query string qui porte la signature. La colonne `runs.input_uri` est en `text` (migration `0002`) : une URL présignée dépasse vite les 512 caractères de départ.
+`http://` en clair et tout autre schéma sont refusés dès le déclenchement (422). Le corps est lu en UTF-8 ; si c'est un objet JSON avec une clé `prompt`, sa valeur (une chaîne non vide) devient le prompt, sinon le corps brut est passé tel quel (JSONL compris). Le prompt n'a pas de limite de taille propre : il est transmis à la CLI sur son entrée standard. La query string qui porte la signature ne ressort ni dans les erreurs, qui ne recopient que `schéma://hôte/chemin`, ni dans les réponses de l'API ; elle reste stockée dans `runs.input_uri` et dans l'env du job worker. La colonne `runs.input_uri` est en `text` (migration `0002`) : une URL présignée dépasse vite les 512 caractères de départ.
 
 Dispatch et réconciliation sont tous deux pilotés par le Container cron à la minute (`POST /admin/tick`), plus le dispatch best-effort en ligne à la création du run.
 
