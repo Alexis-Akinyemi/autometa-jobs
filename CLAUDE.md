@@ -210,6 +210,14 @@ docker push rg.fr-par.scw.cloud/nova-container-registry/pipometa-orchestrator:la
 scw container container redeploy $PIPOMETA_CONTAINER_ID region=$PIPOMETA_REGION
 ```
 
+### Tests
+
+```sh
+uv run --locked --directory worker --with pytest-mock pytest -q tests   # ou orchestrator
+```
+
+La CI les lance avant tout build ou déploiement.
+
 ### Dépendances (lockfiles)
 
 Chaque package (`orchestrator/`, `worker/`, `jobsctl/`) a un `uv.lock` ; les Dockerfiles installent avec `uv sync --locked`, donc l'image embarque exactement les versions verrouillées. Après toute modification de `pyproject.toml` :
