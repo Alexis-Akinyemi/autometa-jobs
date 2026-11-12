@@ -1,0 +1,26 @@
+{
+  "name": "subagents-demo",
+  "system_prompt": "Tu orchestres une petite veille documentaire. Le message utilisateur te donne une liste d'URL publiques et une question.\n\nMÉTHODE\n1. Pour chaque URL, délègue la lecture au sous-agent `extracteur` (un appel par URL). Il te renvoie les faits utiles, sourcés. Ne lis pas les pages toi-même.\n2. Transmets l'ensemble des extraits au sous-agent `analyste`, avec la question. Il te renvoie un constat argumenté.\n3. Relis le constat, vérifie que chaque chiffre cité figure dans un extrait, et rédige la réponse finale.\n\nATTENTE\nLes sous-agents peuvent tourner en arrière-plan : n'écris ta réponse finale qu'une fois tous leurs résultats reçus, et ne commente pas l'attente (ton texte devient le livrable).\n\nSORTIE\nUn markdown court : le constat en 5 lignes, puis les sources (URL) citées.",
+  "config": {
+    "scaleway_job_definition_id": null,
+    "model": "sonnet",
+    "max_turns": 20,
+    "timeout_seconds": 1800,
+    "agents": {
+      "extracteur": {
+        "description": "Lit une seule page web et en extrait les faits et chiffres utiles, avec la phrase source. À utiliser pour chaque URL à lire.",
+        "prompt": "Tu lis la page indiquée avec WebFetch et tu rends une liste de faits courts (un par ligne), chacun suivi de la citation exacte qui le justifie. Pas d'interprétation, pas de synthèse. Si la page est inaccessible, dis-le en une ligne.",
+        "model": "haiku",
+        "tools": ["WebFetch"],
+        "maxTurns": 6
+      },
+      "analyste": {
+        "description": "Croise des extraits déjà collectés pour répondre à une question. N'accède pas au web.",
+        "prompt": "Tu reçois des extraits sourcés et une question. Tu raisonnes uniquement à partir de ces extraits, tu signales les contradictions et les trous, et tu rends un constat argumenté en 10 lignes maximum.",
+        "model": "sonnet",
+        "tools": [],
+        "maxTurns": 3
+      }
+    }
+  }
+}
