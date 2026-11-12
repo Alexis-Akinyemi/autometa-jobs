@@ -111,7 +111,7 @@ jobsctl pipeline-create \
 }
 ```
 
-`description` et `prompt` sont obligatoires ; `model` vaut `haiku`, `sonnet`, `opus` ou `inherit` ; `tools`, `disallowedTools` et `maxTurns` (1 à 200) sont optionnels. Toute autre clé est refusée. 8 sous-agents max, 32 Kio max. `max_turns` du pipeline ne borne que l'agent principal : bornez chaque sous-agent par son `maxTurns`. Les sous-agents tournent en arrière-plan : demandez dans la consigne de n'écrire la réponse finale qu'une fois tous leurs résultats reçus, sans commenter l'attente. Exemple complet : [`pipelines/subagents-demo.json`](pipelines/subagents-demo.json). Détails : [ARCHITECTURE.md § Sous-agents natifs](ARCHITECTURE.md#sous-agents-natifs).
+`description` et `prompt` sont obligatoires ; `model` vaut `haiku`, `sonnet`, `opus` ou `inherit` ; `tools`, `disallowedTools` et `maxTurns` (entier, 1 à 200) sont optionnels. Toute autre clé est refusée ; un nom d'outil inconnu ne l'est pas, mais le run le signale (event `agents_warning`). 8 sous-agents max, 32 Kio max. `max_turns` du pipeline ne borne que l'agent principal : bornez chaque sous-agent par son `maxTurns`. Les sous-agents tournent en arrière-plan ; ce que l'agent principal écrit en les lançant ou en les attendant est écarté du livrable. Exemple complet : [`pipelines/subagents-demo.json`](pipelines/subagents-demo.json). Détails : [ARCHITECTURE.md § Sous-agents natifs](ARCHITECTURE.md#sous-agents-natifs).
 
 Pour ajuster un pipeline existant, ne passez que ce qui change :
 
