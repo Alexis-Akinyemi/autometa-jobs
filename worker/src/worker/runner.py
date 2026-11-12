@@ -7,6 +7,7 @@ on stdout, stderr drained in parallel.
 """
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -287,7 +288,10 @@ _TASK_EVENT_KEYS = (
 
 def _system_event_payload(ev: dict) -> dict:
     payload = {"subtype": ev.get("subtype"), "message": ev.get("message")}
-    if str(ev.get("subtype") or "").startswith("task_"):
+    if ev.get("subtype") == "init":
+        payload["agents"] = ev.get("agents")
+        payload["tools"] = ev.get("tools")
+    elif str(ev.get("subtype") or "").startswith("task_"):
         for key in _TASK_EVENT_KEYS:
             if key in ev:
                 payload[key] = ev[key]
@@ -296,6 +300,31 @@ def _system_event_payload(ev: dict) -> dict:
 
 # The CLI's delegation tool, "Agent" in the stream (formerly "Task").
 _DELEGATION_TOOLS = {"Agent", "Task"}
+
+
+def _missing_agents(init: dict, agents: dict) -> list[str]:
+    """Declared sub-agents the CLI's init event does not list as loaded."""
+    loaded = set(init.get("agents") or [])
+    return [name for name in agents if name not in loaded]
+
+
+def _unlisted_tools(init: dict, agents: dict) -> dict[str, list[str]]:
+    """Sub-agent tool names absent from the CLI's init tool list.
+
+    Only a warning: the CLI loads some tools on demand and leaves them out of
+    that list, so absence does not prove a typo.
+    """
+    listed = set(init.get("tools") or [])
+    if not listed:
+        return {}
+    if listed & _DELEGATION_TOOLS:
+        listed |= _DELEGATION_TOOLS
+    unlisted = {}
+    for name, spec in agents.items():
+        tools = [t for key in ("tools", "disallowedTools") for t in spec.get(key) or []]
+        if missing := [t for t in tools if t.split("(", 1)[0].strip() not in listed]:
+            unlisted[name] = missing
+    return unlisted
 
 
 class _Deliverable:
@@ -339,6 +368,7 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
 
     seq = 1
     deliverable = _Deliverable()
+    init_checked = False
     cli_stderr: list[str] = []
     token_usage: dict | None = None
     exit_code = 0
@@ -446,6 +476,15 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                     deliverable.on_system(ev)
                     await client.event(seq, "system", _system_event_payload(ev))
                     seq += 1
+                    if ev.get("subtype") == "init" and agents and not init_checked:
+                        init_checked = True
+                        if unlisted := _unlisted_tools(ev, agents):
+                            await client.event(seq, "agents_warning", {"unlisted_tools": unlisted})
+                            seq += 1
+                        if missing := _missing_agents(ev, agents):
+                            with contextlib.suppress(ProcessLookupError):
+                                proc.terminate()
+                            raise AgentsConfigError(f"the claude CLI did not load sub-agent(s) {missing}")
                 elif ev_type == "error":
                     await client.event(seq, "claude_error", ev)
                     seq += 1

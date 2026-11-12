@@ -283,3 +283,41 @@ def test_deliverable_leaves_out_text_around_subagents(events, expected):
         else:
             deliverable.on_main_agent(ev, [b["text"] for b in ev["message"]["content"] if b["type"] == "text"])
     assert deliverable.text() == expected
+
+
+def test_run_fails_when_the_cli_does_not_load_a_subagent(fake_cli, run_worker):
+    fake_cli(RECORDED_STREAM.read_text())
+    ghost = {"ghost": {"description": "Not loaded.", "prompt": "Never runs."}}
+    run = run_worker(PIPOMETA_AGENTS=json.dumps({**ECHOER, **ghost}))
+    assert run.rc == 1
+    errors = [p for t, p in run.events if t == "error"]
+    assert errors[0]["type"] == "AgentsConfigError" and "['ghost']" in errors[0]["message"]
+    assert run.artifacts == []
+
+
+def test_init_event_lists_loaded_agents_and_tools(fake_cli, run_worker):
+    fake_cli(RECORDED_STREAM.read_text())
+    run = run_worker(PIPOMETA_AGENTS=json.dumps(ECHOER))
+    init = next(p for t, p in run.events if t == "system" and p["subtype"] == "init")
+    assert "echoer" in init["agents"] and "Read" in init["tools"]
+    assert not [p for t, p in run.events if t == "agents_warning"]
+
+
+@pytest.mark.parametrize(
+    "spec,unlisted",
+    [
+        ({"tools": ["Read", "Bash(git:*)", "Agent"]}, {}),
+        ({"tools": ["WebFech"]}, {"echoer": ["WebFech"]}),
+        ({"tools": ["Read"], "disallowedTools": ["Bassh"]}, {"echoer": ["Bassh"]}),
+    ],
+)
+def test_unlisted_subagent_tools_are_reported(fake_cli, run_worker, spec, unlisted):
+    fake_cli(RECORDED_STREAM.read_text())
+    run = run_worker(PIPOMETA_AGENTS=json.dumps({"echoer": {**ECHOER["echoer"], **spec}}))
+    assert run.rc == 0
+    warnings = [p["unlisted_tools"] for t, p in run.events if t == "agents_warning"]
+    assert warnings == ([unlisted] if unlisted else [])
+
+
+def test_unlisted_tools_not_judged_without_a_tool_list():
+    assert runner._unlisted_tools({"agents": ["echoer"]}, {"echoer": {"tools": ["WebFech"]}}) == {}
