@@ -1,7 +1,7 @@
 import json
 
 import pytest
-from worker.runner import AgentsConfigError, build_command
+from worker.runner import AgentsConfigError, _load_agents, build_command
 
 from worker import runner
 
@@ -45,18 +45,18 @@ LEGACY_ENVS = [
 
 @pytest.mark.parametrize("env", LEGACY_ENVS)
 def test_command_without_agents_is_byte_identical(env):
-    assert build_command("sys", env) == legacy_command("sys", env)
+    assert build_command("sys", env, {}) == legacy_command("sys", env)
 
 
 def test_agents_appended_after_legacy_flags():
-    env = {"PIPOMETA_MAX_TURNS": "20", "PIPOMETA_MODEL": "opus", "PIPOMETA_AGENTS": AGENTS_JSON}
-    cmd = build_command("sys", env)
+    env = {"PIPOMETA_MAX_TURNS": "20", "PIPOMETA_MODEL": "opus"}
+    cmd = build_command("sys", env, AGENTS)
     assert cmd[:-2] == legacy_command("sys", env)
     assert cmd[-2:] == ["--agents", AGENTS_JSON]
 
 
 def test_unrestricted_tools_stay_unrestricted_with_agents():
-    cmd = build_command("s", {"PIPOMETA_AGENTS": AGENTS_JSON})
+    cmd = build_command("s", {}, AGENTS)
     assert "--allowedTools" not in cmd
 
 
@@ -65,18 +65,18 @@ def _allowed(cmd: list[str]) -> str:
 
 
 def test_delegation_tool_added_to_restricted_tools():
-    cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read,Bash(git *)", "PIPOMETA_AGENTS": AGENTS_JSON})
+    cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read,Bash(git *)"}, AGENTS)
     assert _allowed(cmd) == "Read,Bash(git *),Task"
 
 
 @pytest.mark.parametrize("tools", ["Read,Task", "Task", "Agent,Read", "Read, Task", "Read,Task(triage)"])
 def test_delegation_tool_not_duplicated(tools):
-    cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": tools, "PIPOMETA_AGENTS": AGENTS_JSON})
+    cmd = build_command("s", {"PIPOMETA_ALLOWED_TOOLS": tools}, AGENTS)
     assert _allowed(cmd) == tools
 
 
 def test_delegation_tool_not_added_without_agents():
-    assert _allowed(build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read"})) == "Read"
+    assert _allowed(build_command("s", {"PIPOMETA_ALLOWED_TOOLS": "Read"}, {})) == "Read"
 
 
 @pytest.mark.parametrize(
@@ -92,7 +92,7 @@ def test_delegation_tool_not_added_without_agents():
 )
 def test_invalid_agents_rejected(raw, needle):
     with pytest.raises(AgentsConfigError, match=needle):
-        build_command("s", {"PIPOMETA_AGENTS": raw})
+        _load_agents(raw)
 
 
 # --- end-to-end on a fake CLI -------------------------------------------------
@@ -225,10 +225,12 @@ def test_subagent_events_traced_and_kept_out_of_artifact(fake_cli, run_worker):
     assert run.artifacts == ["Final: 3 categories."]
 
 
-def test_invalid_agents_fail_the_run_before_starting_cli(fake_cli, run_worker):
+def test_invalid_agents_fail_the_run_before_reading_input(fake_cli, run_worker, mocker):
     cli = fake_cli(SUBAGENT_STREAM)
+    read_prompt = mocker.patch.object(runner, "_read_prompt", return_value="unused")
     run = run_worker(PIPOMETA_AGENTS="{oops")
     assert run.rc == 1
+    read_prompt.assert_not_awaited()
     assert not cli.started()
     errors = [p for t, p in run.events if t == "error"]
     assert errors and errors[0]["type"] == "AgentsConfigError"

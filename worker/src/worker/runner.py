@@ -222,8 +222,8 @@ class AgentsConfigError(ValueError):
     pass
 
 
-def _load_agents(raw: str) -> str:
-    """Check PIPOMETA_AGENTS and return the JSON to pass to `claude --agents`.
+def _load_agents(raw: str) -> dict:
+    """Parse and check PIPOMETA_AGENTS, the sub-agents to pass to `claude --agents`.
 
     The orchestrator already validated it against the full schema; this is a
     last structural check so a corrupt value fails the run loudly instead of
@@ -241,7 +241,7 @@ def _load_agents(raw: str) -> str:
         for key in ("description", "prompt"):
             if not isinstance(spec.get(key), str) or not spec[key].strip():
                 raise AgentsConfigError(f"PIPOMETA_AGENTS[{name!r}].{key} must be a non-empty string")
-    return raw
+    return agents
 
 
 def _with_delegation_tool(allowed_tools: str) -> str:
@@ -252,10 +252,10 @@ def _with_delegation_tool(allowed_tools: str) -> str:
     return f"{allowed_tools},{DELEGATION_TOOL}"
 
 
-def build_command(system_prompt: str, env: Mapping[str, str]) -> list[str]:
+def build_command(system_prompt: str, env: Mapping[str, str], agents: dict) -> list[str]:
     """argv for the claude CLI (the prompt goes in on stdin).
 
-    Without PIPOMETA_AGENTS it is the historical command, unchanged.
+    Without sub-agents it is the historical command, unchanged.
     """
     # Worker container runs as non-root `runner`, so the CLI accepts
     # --dangerously-skip-permissions. The container itself is the security
@@ -272,8 +272,6 @@ def build_command(system_prompt: str, env: Mapping[str, str]) -> list[str]:
         "--dangerously-skip-permissions",
         "-p",
     ]
-    agents_raw = (env.get("PIPOMETA_AGENTS") or "").strip()
-    agents = _load_agents(agents_raw) if agents_raw else None
     if extra_tools := (env.get("PIPOMETA_ALLOWED_TOOLS") or "").strip():
         if agents:
             extra_tools = _with_delegation_tool(extra_tools)
@@ -283,7 +281,7 @@ def build_command(system_prompt: str, env: Mapping[str, str]) -> list[str]:
     if model := (env.get("PIPOMETA_MODEL") or "").strip():
         cmd.extend(["--model", model])
     if agents:
-        cmd.extend(["--agents", agents])
+        cmd.extend(["--agents", json.dumps(agents, ensure_ascii=False, separators=(",", ":"))])
     return cmd
 
 
@@ -328,14 +326,16 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
         await client.event(seq, "started", {"pid": os.getpid()})
         seq += 1
 
-        prompt = await _read_prompt()
-        await client.event(seq, "prompt_loaded", {"chars": len(prompt)})
-        seq += 1
-
         system_prompt = (os.environ.get("PIPOMETA_SYSTEM_PROMPT") or "").strip() or (
             "You are a focused assistant. Be concise."
         )
-        cmd = build_command(system_prompt, os.environ)
+        agents_raw = (os.environ.get("PIPOMETA_AGENTS") or "").strip()
+        agents = _load_agents(agents_raw) if agents_raw else {}
+        cmd = build_command(system_prompt, os.environ, agents)
+
+        prompt = await _read_prompt()
+        await client.event(seq, "prompt_loaded", {"chars": len(prompt)})
+        seq += 1
         # Pass the env through unchanged. Dispatch sets ANTHROPIC_API_KEY="" so
         # the CLI sees an explicit empty value rather than nothing — empty blocks
         # the API-key fallback path; unset would let some code paths re-resolve.
