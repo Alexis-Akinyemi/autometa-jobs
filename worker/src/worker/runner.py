@@ -11,7 +11,10 @@ import io
 import json
 import logging
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import boto3
 
@@ -42,6 +45,77 @@ async def _heartbeat_task(client: OrchestratorClient, stop: asyncio.Event) -> No
             pass
 
 
+# Input bundles fetched over https (e.g. a presigned URL on the caller's own
+# bucket) are capped so a wrong link cannot fill the container's memory.
+_INPUT_MAX_BYTES = 50 * 1024 * 1024
+_INPUT_HTTP_TIMEOUT_S = 60
+
+
+def _redact_uri(uri: str) -> str:
+    """scheme://host/path only: no query (presigned URLs carry their signature
+    there), no fragment, no userinfo. Safe to put in errors and run events."""
+    try:
+        parts = urlsplit(uri)
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        return "<unparseable uri>"
+    if not parts.scheme:
+        return "<uri without scheme>"
+    return f"{parts.scheme}://{host}{parts.path}"
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to https, never downgrade to plain http."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != "https":
+            raise ValueError(f"input uri redirected to a non-https location: {_redact_uri(newurl)}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTPS_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+
+
+def _fetch_https(uri: str) -> str:
+    safe = _redact_uri(uri)
+    req = urllib.request.Request(uri, headers={"User-Agent": "pipometa-worker"})
+    try:
+        with _HTTPS_OPENER.open(req, timeout=_INPUT_HTTP_TIMEOUT_S) as resp:
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > _INPUT_MAX_BYTES:
+                raise ValueError(f"input too large ({int(declared)} bytes > {_INPUT_MAX_BYTES}): {safe}")
+            data = resp.read(_INPUT_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        # `from None`: the original exception carries the full signed URL.
+        raise ValueError(f"input fetch failed (HTTP {e.code}): {safe}") from None
+    except urllib.error.URLError as e:
+        raise ValueError(f"input fetch failed ({type(e.reason).__name__}): {safe}") from None
+    except TimeoutError:
+        raise ValueError(f"input fetch timed out after {_INPUT_HTTP_TIMEOUT_S}s: {safe}") from None
+    if len(data) > _INPUT_MAX_BYTES:
+        raise ValueError(f"input too large (> {_INPUT_MAX_BYTES} bytes): {safe}")
+    return data.decode("utf-8")
+
+
+def _fetch_s3(uri: str) -> str:
+    bucket, _, key = uri[5:].partition("/")
+    s3 = _s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+
+
+def _prompt_from_body(body: str) -> str:
+    """A JSON object's `prompt` key if present, the raw body otherwise."""
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if isinstance(doc, dict):
+        return doc.get("prompt", body)
+    return body
+
+
 def _read_prompt() -> str:
     input_uri = os.environ.get("PIPOMETA_INPUT_URI")
     if not input_uri:
@@ -55,15 +129,14 @@ def _read_prompt() -> str:
         if system_prompt:
             return system_prompt
         return "Say hello in 3 lines, in French. End with a haiku."
-    if not input_uri.startswith("s3://"):
-        raise ValueError(f"unsupported input uri scheme: {input_uri}")
-    bucket, _, key = input_uri[5:].partition("/")
-    s3 = _s3_client()
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
-    try:
-        return json.loads(body).get("prompt", body)
-    except json.JSONDecodeError:
-        return body
+    if input_uri.startswith("s3://"):
+        body = _fetch_s3(input_uri)
+    elif input_uri.startswith("https://"):
+        body = _fetch_https(input_uri)
+    else:
+        # Plain http:// is refused: the bundle is the agent's instructions.
+        raise ValueError(f"unsupported input uri scheme (expected s3:// or https://): {_redact_uri(input_uri)}")
+    return _prompt_from_body(body)
 
 
 # Output formats a pipeline may declare (config.output_format) → (filename, content-type).
