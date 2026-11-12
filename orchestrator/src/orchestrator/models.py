@@ -51,7 +51,8 @@ class Run(Base):
     pipeline_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("pipelines.id"))
     status: Mapped[RunStatus] = mapped_column(Enum(RunStatus, name="run_status"), default=RunStatus.queued, index=True)
     scaleway_job_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    input_uri: Mapped[str | None] = mapped_column(String(512))
+    input_uri: Mapped[str | None] = mapped_column(Text)
+    """s3://bucket/key or an https:// (often presigned) URL; a presigned one already runs to ~400 chars."""
     output_uri: Mapped[str | None] = mapped_column(String(512))
     summary: Mapped[str | None] = mapped_column(Text)
     error_text: Mapped[str | None] = mapped_column(Text)
