@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, text
 
 from orchestrator import scaleway
+from orchestrator.agents import AgentsConfigError, encode_agents, normalize_agents
 from orchestrator.auth import new_hmac_key
 from orchestrator.config import settings
 from orchestrator.db import SessionLocal
@@ -58,37 +59,19 @@ async def _dispatch_one() -> bool:
         await _mark_failed(run.id, "pipeline config missing scaleway_job_definition_id")
         return True
 
-    allowed_tools = config.get("allowed_tools") or ""
-    if isinstance(allowed_tools, list):
-        allowed_tools = ",".join(allowed_tools)
-    max_turns = config.get("max_turns")
-    model = config.get("model") or ""
-
-    env = {
-        # Run identity / callback channel
-        "PIPOMETA_RUN_ID": str(run.id),
-        "PIPOMETA_PIPELINE_NAME": pipeline_name,
-        "PIPOMETA_ORCHESTRATOR_URL": settings.public_url,
-        "PIPOMETA_RUN_HMAC_KEY": run.hmac_key or "",
-        # Pipeline contract
-        "PIPOMETA_SYSTEM_PROMPT": (pipeline.system_prompt if pipeline else "") or "",
-        "PIPOMETA_ALLOWED_TOOLS": str(allowed_tools),
-        "PIPOMETA_MAX_TURNS": str(max_turns) if max_turns else "",
-        "PIPOMETA_MODEL": str(model),
-        # I/O
-        "PIPOMETA_INPUT_URI": run.input_uri or "",
-        "PIPOMETA_OUTPUT_BUCKET": settings.s3_bucket,
-        "PIPOMETA_OUTPUT_FORMAT": str(config.get("output_format") or "md"),
-        "PIPOMETA_S3_ENDPOINT": settings.s3_endpoint,
-        # Auth
-        "CLAUDE_CODE_OAUTH_TOKEN": oauth_token,
-        # Defensive: empty string (not unset) blocks the API-key fallback path.
-        "ANTHROPIC_API_KEY": "",
-        # boto3 credentials for the Scaleway S3-compatible bucket.
-        "AWS_ACCESS_KEY_ID": settings.scaleway_access_key,
-        "AWS_SECRET_ACCESS_KEY": settings.scaleway_secret_key,
-        "AWS_DEFAULT_REGION": settings.scaleway_region,
-    }
+    try:
+        env = build_worker_env(
+            run_id=str(run.id),
+            hmac_key=run.hmac_key or "",
+            input_uri=run.input_uri,
+            pipeline_name=pipeline_name,
+            system_prompt=(pipeline.system_prompt if pipeline else "") or "",
+            config=config,
+            oauth_token=oauth_token,
+        )
+    except AgentsConfigError as e:
+        await _mark_failed(run.id, str(e))
+        return True
 
     try:
         job_run = await scaleway.start_job(job_def_id, env)
@@ -125,3 +108,64 @@ async def _mark_failed(run_id, reason: str) -> None:
         run.error_text = reason
         run.finished_at = datetime.now(timezone.utc)
         await session.commit()
+
+
+def agents_env_value(config: dict) -> str | None:
+    """PIPOMETA_AGENTS value for this pipeline config, or None when no sub-agents.
+
+    Re-validates: a config may predate agents validation or be edited in SQL.
+    Raises AgentsConfigError (bad shape, too many agents, over the size cap).
+    """
+    raw = config.get("agents")
+    if raw is None:
+        return None
+    return encode_agents(normalize_agents(raw))
+
+
+def build_worker_env(
+    *,
+    run_id: str,
+    hmac_key: str,
+    input_uri: str | None,
+    pipeline_name: str,
+    system_prompt: str,
+    config: dict,
+    oauth_token: str,
+) -> dict[str, str]:
+    """Environment injected into the worker Job for one run."""
+    allowed_tools = config.get("allowed_tools") or ""
+    if isinstance(allowed_tools, list):
+        allowed_tools = ",".join(allowed_tools)
+    max_turns = config.get("max_turns")
+    model = config.get("model") or ""
+
+    env = {
+        # Run identity / callback channel
+        "PIPOMETA_RUN_ID": run_id,
+        "PIPOMETA_PIPELINE_NAME": pipeline_name,
+        "PIPOMETA_ORCHESTRATOR_URL": settings.public_url,
+        "PIPOMETA_RUN_HMAC_KEY": hmac_key,
+        # Pipeline contract
+        "PIPOMETA_SYSTEM_PROMPT": system_prompt,
+        "PIPOMETA_ALLOWED_TOOLS": str(allowed_tools),
+        "PIPOMETA_MAX_TURNS": str(max_turns) if max_turns else "",
+        "PIPOMETA_MODEL": str(model),
+        # I/O
+        "PIPOMETA_INPUT_URI": input_uri or "",
+        "PIPOMETA_OUTPUT_BUCKET": settings.s3_bucket,
+        "PIPOMETA_OUTPUT_FORMAT": str(config.get("output_format") or "md"),
+        "PIPOMETA_S3_ENDPOINT": settings.s3_endpoint,
+        # Auth
+        "CLAUDE_CODE_OAUTH_TOKEN": oauth_token,
+        # Defensive: empty string (not unset) blocks the API-key fallback path.
+        "ANTHROPIC_API_KEY": "",
+        # boto3 credentials for the Scaleway S3-compatible bucket.
+        "AWS_ACCESS_KEY_ID": settings.scaleway_access_key,
+        "AWS_SECRET_ACCESS_KEY": settings.scaleway_secret_key,
+        "AWS_DEFAULT_REGION": settings.scaleway_region,
+    }
+    # Native Claude sub-agents (claude --agents). Only set when configured, so
+    # a pipeline without agents gets exactly the environment it got before.
+    if (agents := agents_env_value(config)) is not None:
+        env["PIPOMETA_AGENTS"] = agents
+    return env

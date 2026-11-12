@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
+from orchestrator.agents import validate_config
 from orchestrator.models import RunStatus
 
 INPUT_URI_SCHEMES = ("s3", "https")
@@ -14,11 +15,21 @@ class PipelineCreate(BaseModel):
     system_prompt: str
     config: dict = Field(default_factory=dict)
 
+    @field_validator("config")
+    @classmethod
+    def _validate_agents(cls, v: dict) -> dict:
+        return validate_config(v)
+
 
 class PipelineUpdate(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
     config: dict | None = None
+
+    @field_validator("config")
+    @classmethod
+    def _validate_agents(cls, v: dict | None) -> dict | None:
+        return validate_config(v)
 
 
 class PipelineRead(BaseModel):
