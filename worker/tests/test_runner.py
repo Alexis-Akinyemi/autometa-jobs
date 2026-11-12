@@ -1,8 +1,4 @@
-import asyncio
 import json
-import os
-import stat
-import sys
 
 import pytest
 from worker.runner import AgentsConfigError, build_command
@@ -102,24 +98,6 @@ def test_invalid_agents_rejected(raw, needle):
 # --- end-to-end on a fake CLI -------------------------------------------------
 
 
-class FakeClient:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-        self.results: list[dict] = []
-
-    async def event(self, seq, event_type, payload):
-        self.events.append((event_type, payload))
-
-    async def heartbeat(self):
-        pass
-
-    async def result(self, **kwargs):
-        self.results.append(kwargs)
-
-    async def aclose(self):
-        pass
-
-
 def _stream(*events: dict) -> str:
     return "\n".join(json.dumps(e) for e in events) + "\n"
 
@@ -196,58 +174,26 @@ SUBAGENT_STREAM = _stream(
 )
 
 
-@pytest.fixture
-def fake_cli(tmp_path, monkeypatch):
-    def make(stream: str):
-        stream_file = tmp_path / "stream.jsonl"
-        stream_file.write_text(stream)
-        argv_file = tmp_path / "argv.json"
-        stdin_file = tmp_path / "stdin.txt"
-        script = tmp_path / "claude"
-        script.write_text(
-            f"#!{sys.executable}\n"
-            "import json, sys\n"
-            f"open({str(argv_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-            f"open({str(stdin_file)!r}, 'w').write(sys.stdin.read())\n"
-            f"sys.stdout.write(open({str(stream_file)!r}).read())\n"
-        )
-        script.chmod(script.stat().st_mode | stat.S_IXUSR)
-        monkeypatch.setattr(runner, "CLAUDE_BIN", str(script))
-        return argv_file
-
-    return make
+def _by_type(events):
+    by_type: dict[str, list[dict]] = {}
+    for event_type, payload in events:
+        by_type.setdefault(event_type, []).append(payload)
+    return by_type
 
 
-def _run(monkeypatch, env: dict) -> tuple[int, FakeClient, list[str]]:
-    client = FakeClient()
-    uploaded: list[str] = []
-    monkeypatch.setattr(runner, "OrchestratorClient", lambda: client)
-    monkeypatch.setattr(runner, "_upload_artifact", lambda text: uploaded.append(text) or "s3://b/k/output.md")
-    for key in ("PIPOMETA_INPUT_URI", "PIPOMETA_ALLOWED_TOOLS", "PIPOMETA_MAX_TURNS", "PIPOMETA_MODEL"):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("PIPOMETA_SYSTEM_PROMPT", "Orchestrate.")
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    rc = asyncio.run(runner.run_pipeline(asyncio.Event()))
-    return rc, client, uploaded
+def test_subagent_events_traced_and_kept_out_of_artifact(fake_cli, run_worker):
+    cli = fake_cli(SUBAGENT_STREAM)
+    run = run_worker(PIPOMETA_AGENTS=AGENTS_JSON, PIPOMETA_ALLOWED_TOOLS="Read")
+    assert run.rc == 0
 
-
-def test_subagent_events_traced_and_kept_out_of_artifact(fake_cli, monkeypatch):
-    argv_file = fake_cli(SUBAGENT_STREAM)
-    rc, client, uploaded = _run(monkeypatch, {"PIPOMETA_AGENTS": AGENTS_JSON, "PIPOMETA_ALLOWED_TOOLS": "Read"})
-    assert rc == 0
-
-    argv = json.loads(argv_file.read_text())
+    argv = cli.argv()
     # The prompt goes in on stdin; in argv it only appears as the system prompt.
-    assert (argv_file.parent / "stdin.txt").read_text() == "Orchestrate."
+    assert cli.stdin() == "Orchestrate."
     assert argv.count("Orchestrate.") == 1 and argv[argv.index("--system-prompt") + 1] == "Orchestrate."
     assert argv[argv.index("--agents") + 1] == AGENTS_JSON
     assert argv[argv.index("--allowedTools") + 1] == "Read,Task"
 
-    by_type: dict[str, list[dict]] = {}
-    for event_type, payload in client.events:
-        by_type.setdefault(event_type, []).append(payload)
-
+    by_type = _by_type(run.events)
     # The delegation call itself, from the main agent.
     calls = [b for p in by_type["assistant_message"] for b in p["blocks"] if b["type"] == "tool_use"]
     assert calls == [
@@ -271,29 +217,36 @@ def test_subagent_events_traced_and_kept_out_of_artifact(fake_cli, monkeypatch):
     assert notified["status"] == "completed" and notified["usage"]["total_tokens"] == 1673
     assert "output_file" not in notified
     # Result carries sub-agent counters and per-model usage.
-    usage = client.results[0]["token_usage"]
+    usage = run.results[0]["token_usage"]
     assert usage["subagent_stats"]["by_type"] == {"triage": 1}
     assert usage["modelUsage"] == {"claude-haiku": {"outputTokens": 10}}
 
     # Artifact: main agent's text only.
-    assert uploaded == ["Final: 3 categories."]
+    assert run.artifacts == ["Final: 3 categories."]
 
 
-def test_invalid_agents_fail_the_run_before_starting_cli(fake_cli, monkeypatch):
-    argv_file = fake_cli(SUBAGENT_STREAM)
-    rc, client, uploaded = _run(monkeypatch, {"PIPOMETA_AGENTS": "{oops"})
-    assert rc == 1
-    assert not argv_file.exists()  # the CLI never started
-    errors = [p for t, p in client.events if t == "error"]
+def test_invalid_agents_fail_the_run_before_starting_cli(fake_cli, run_worker):
+    cli = fake_cli(SUBAGENT_STREAM)
+    run = run_worker(PIPOMETA_AGENTS="{oops")
+    assert run.rc == 1
+    assert not cli.started()
+    errors = [p for t, p in run.events if t == "error"]
     assert errors and errors[0]["type"] == "AgentsConfigError"
     assert "PIPOMETA_AGENTS is not valid JSON" in errors[0]["message"]
-    assert uploaded == [] and client.results == []
+    assert run.artifacts == [] and run.results == []
 
 
-def test_run_without_agents_uses_legacy_command(fake_cli, monkeypatch):
-    argv_file = fake_cli(_stream({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}))
-    monkeypatch.delenv("PIPOMETA_AGENTS", raising=False)
-    rc, _client, uploaded = _run(monkeypatch, {"PIPOMETA_MAX_TURNS": "4"})
-    assert rc == 0 and uploaded == ["hi"]
-    env = {**os.environ}
-    assert json.loads(argv_file.read_text()) == legacy_command("Orchestrate.", env)[1:]
+def test_run_without_agents_uses_legacy_command(fake_cli, run_worker):
+    cli = fake_cli(_stream({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}))
+    run = run_worker(PIPOMETA_MAX_TURNS="4")
+    assert run.rc == 0 and run.artifacts == ["hi"]
+    assert cli.argv() == legacy_command("Orchestrate.", {"PIPOMETA_MAX_TURNS": "4"})[1:]
+
+
+def test_large_prompt_reaches_cli_on_stdin(fake_cli, run_worker, mocker):
+    cli = fake_cli(_stream({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}))
+    # Over Linux's 128 KiB cap on a single argv string.
+    mocker.patch.object(runner, "_read_prompt", return_value="x" * 300_000)
+    assert run_worker().rc == 0
+    assert cli.stdin() == "x" * 300_000
+    assert max(map(len, cli.argv())) < 1000
