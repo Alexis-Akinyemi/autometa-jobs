@@ -246,6 +246,13 @@ def test_recorded_background_subagent_run(fake_cli, run_worker):
     run = run_worker(PIPOMETA_AGENTS=json.dumps(ECHOER))
     assert run.rc == 0
     assert run.artifacts == ["RESULT=BANANE"]
+    # Three result events (per turn, then running totals) fold into one usage.
+    assert len([p for t, p in run.events if t == "result"]) == 3
+    usage = run.results[0]["token_usage"]
+    assert (usage["num_turns"], usage["duration_ms"], usage["duration_api_ms"]) == (3, 6062, 8222)
+    assert (usage["usage"]["input_tokens"], usage["usage"]["output_tokens"]) == (8, 389)
+    assert usage["total_cost_usd"] == pytest.approx(0.0057, abs=1e-4)
+    assert usage["subagent_stats"]["by_type"] == {"echoer": 1}
 
 
 def _main(msg_id, *blocks):

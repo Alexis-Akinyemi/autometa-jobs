@@ -298,6 +298,45 @@ def _system_event_payload(ev: dict) -> dict:
     return payload
 
 
+def _result_usage(ev: dict) -> dict:
+    usage = {
+        "duration_ms": ev.get("duration_ms"),
+        "duration_api_ms": ev.get("duration_api_ms"),
+        "num_turns": ev.get("num_turns"),
+        "total_cost_usd": ev.get("total_cost_usd"),
+        "usage": ev.get("usage"),
+        "subtype": ev.get("subtype"),
+    }
+    # Per-model usage and sub-agent counters, when the CLI reports them.
+    for key in ("modelUsage", "subagent_stats"):
+        if ev.get(key) is not None:
+            usage[key] = ev[key]
+    return usage
+
+
+def _add_result(total: dict | None, result: dict) -> dict:
+    """Fold one `result` event into the run's usage.
+
+    With background sub-agents the CLI ends a run with several result events:
+    turns, duration and token counts are per event; cost, per-model usage and
+    sub-agent counters are already running totals, and so is API time except
+    on a closing event with no turn, where it reads 0.
+    """
+    if total is None:
+        return result
+    previous = total.get("usage") or {}
+    return {
+        **result,
+        "num_turns": (total.get("num_turns") or 0) + (result.get("num_turns") or 0),
+        "duration_ms": (total.get("duration_ms") or 0) + (result.get("duration_ms") or 0),
+        "duration_api_ms": max(total.get("duration_api_ms") or 0, result.get("duration_api_ms") or 0),
+        "usage": {
+            key: previous.get(key, 0) + value if isinstance(value, int) else value
+            for key, value in (result.get("usage") or {}).items()
+        },
+    }
+
+
 # The CLI's delegation tool, "Agent" in the stream (formerly "Task").
 _DELEGATION_TOOLS = {"Agent", "Task"}
 
@@ -458,19 +497,9 @@ async def run_pipeline(cancelled: asyncio.Event) -> int:
                             await client.event(seq, "tool_result", payload)
                             seq += 1
                 elif ev_type == "result":
-                    token_usage = {
-                        "duration_ms": ev.get("duration_ms"),
-                        "duration_api_ms": ev.get("duration_api_ms"),
-                        "num_turns": ev.get("num_turns"),
-                        "total_cost_usd": ev.get("total_cost_usd"),
-                        "usage": ev.get("usage"),
-                        "subtype": ev.get("subtype"),
-                    }
-                    # Per-model usage and sub-agent counters, when the CLI reports them.
-                    for key in ("modelUsage", "subagent_stats"):
-                        if ev.get(key) is not None:
-                            token_usage[key] = ev[key]
-                    await client.event(seq, "result", token_usage)
+                    result_usage = _result_usage(ev)
+                    token_usage = _add_result(token_usage, result_usage)
+                    await client.event(seq, "result", result_usage)
                     seq += 1
                 elif ev_type == "system":
                     deliverable.on_system(ev)
